@@ -467,6 +467,24 @@ class PerceptualScoreResult:
         }
 
 
+_MAE_BRANCH_DECAY = 4.0
+"""Decay rate ``k`` of the new ``exp(-k * weighted_mae)`` mapping.
+
+Calibrated against the synthetic E-009 / E-011 sweeps so that:
+
+* ``MAE = 0.00`` → ``mae_branch = 1.00`` (perfect match)
+* ``MAE = 0.05`` → ``mae_branch ≈ 0.82`` (~20 / 255 channel error, target hit)
+* ``MAE = 0.10`` → ``mae_branch ≈ 0.67``
+* ``MAE = 0.20`` → ``mae_branch ≈ 0.45``
+* ``MAE = 0.33`` → ``mae_branch ≈ 0.27`` (the fish_1580 baseline that
+  the old ``1 - sqrt(4·MAE)`` mapping clipped to 0 — now visible).
+
+Crucially the curve is **strictly monotonic** for any finite MAE,
+so the optimizer always sees a non-zero gradient when it improves
+even slightly, which is exactly what the legacy mapping killed
+once MAE crossed 0.25."""
+
+
 def combine_fit_score(
     *,
     weighted_mae: float,
@@ -475,29 +493,59 @@ def combine_fit_score(
 ) -> tuple[float, dict[str, float]]:
     """Combine weighted-MAE and SSIM into a single ``fit_score`` in [0, 1].
 
-    The MAE branch uses the same ``1 - sqrt(MAE * 4)`` perceptual
-    mapping as the legacy ``_diff_score_to_fit_score(mode="perceptual")``
-    so that historical thresholds remain interpretable. The SSIM
-    branch is mapped to [0, 1] via ``max(0, ssim)``.
+    Phase-summary 2026-05-08 P0 fix
+    -------------------------------
 
-    The ``weights`` tuple is ``(w_mae, w_ssim)`` and must sum to 1.0
-    after normalisation; if SSIM is unavailable, the MAE branch is
-    used 100%.
+    The legacy MAE branch was ``max(0, 1 - sqrt(4·weighted_mae))``,
+    which clips to ``0`` for ``weighted_mae > 0.25``. The fish_1580
+    run (``best_mae=0.21``, ``weighted_mae≈0.33``) lived entirely in
+    that saturated region, so the optimizer saw a flat zero on the
+    MAE side for **all** 42 iterations and was effectively driven by
+    SSIM noise alone (delta ≈ 1e-5).
+
+    The new mapping is ``exp(-k · weighted_mae)`` with
+    ``k = _MAE_BRANCH_DECAY``. This is strictly monotonic in MAE,
+    so any genuine improvement — even from 0.34 to 0.30 — produces a
+    measurable, sign-correct change in ``fit_score``. The SSIM
+    branch keeps its ``max(0, ssim)`` mapping; weights stay (0.7, 0.3).
+
+    The companion field ``mae_branch_saturated`` is **always False**
+    under the new mapping and is exposed only so downstream
+    diagnostics can confirm the upgrade is in effect.
 
     Returns ``(fit_score, components)`` where ``components`` keeps
-    the un-combined branch scores for diagnostics.
+    the un-combined branch scores plus the saturation flag for
+    diagnostics.
     """
 
     if not math.isfinite(weighted_mae):
-        return 0.0, {"mae_branch": 0.0, "ssim_branch": 0.0}
+        return 0.0, {
+            "mae_branch": 0.0,
+            "ssim_branch": 0.0,
+            "mae_branch_saturated": False,
+            "mae_mapping": "exp_decay",
+            "mae_decay_k": _MAE_BRANCH_DECAY,
+        }
 
-    mae_branch = max(0.0, 1.0 - math.sqrt(max(0.0, weighted_mae) * 4.0))
+    mae_clamped = max(0.0, float(weighted_mae))
+    mae_branch = math.exp(-_MAE_BRANCH_DECAY * mae_clamped)
+    mae_branch = min(1.0, max(0.0, mae_branch))
+    # Legacy mapping value preserved for forensic comparison only —
+    # this is what the pre-P0 build would have produced and is what
+    # the fish_1580 saturation diagnosis uses to confirm the bug.
+    legacy_mae_branch = max(0.0, 1.0 - math.sqrt(mae_clamped * 4.0))
+    legacy_saturated = mae_clamped > 0.25
 
     if ssim is None or not math.isfinite(float(ssim)):
         # Degrade gracefully to MAE-only.
-        return min(1.0, max(0.0, mae_branch)), {
+        return mae_branch, {
             "mae_branch": mae_branch,
             "ssim_branch": float("nan"),
+            "mae_branch_saturated": False,
+            "legacy_mae_branch": legacy_mae_branch,
+            "legacy_mae_branch_saturated": legacy_saturated,
+            "mae_mapping": "exp_decay",
+            "mae_decay_k": _MAE_BRANCH_DECAY,
         }
 
     ssim_branch = max(0.0, min(1.0, float(ssim)))
@@ -507,7 +555,15 @@ def combine_fit_score(
         total = 1.0
     fit = (mae_branch * w_mae + ssim_branch * w_ssim) / total
     fit = min(1.0, max(0.0, fit))
-    return fit, {"mae_branch": mae_branch, "ssim_branch": ssim_branch}
+    return fit, {
+        "mae_branch": mae_branch,
+        "ssim_branch": ssim_branch,
+        "mae_branch_saturated": False,
+        "legacy_mae_branch": legacy_mae_branch,
+        "legacy_mae_branch_saturated": legacy_saturated,
+        "mae_mapping": "exp_decay",
+        "mae_decay_k": _MAE_BRANCH_DECAY,
+    }
 
 
 def perceptual_score_from_analysis(

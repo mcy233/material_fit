@@ -10,6 +10,7 @@ const project = ref<ProjectDetail | null>(null);
 const loading = ref(false);
 const saving = ref(false);
 const error = ref<string | null>(null);
+const useLlm = ref(true);
 const filter = ref<'all' | 'manual' | 'curated' | 'exact' | 'fuzzy' | 'unity_only' | 'laya_only'>('all');
 const editingRow = ref<string | null>(null);
 const editTarget = ref('');
@@ -38,7 +39,7 @@ async function load(): Promise<void> {
 async function rerun(): Promise<void> {
   loading.value = true;
   try {
-    data.value = await runPreanalysis(props.projectId);
+    data.value = await runPreanalysis(props.projectId, { use_llm: useLlm.value });
     project.value = await fetchProject(props.projectId);
     error.value = null;
   } catch (err) {
@@ -123,6 +124,28 @@ const counts = computed(() => {
   return out;
 });
 
+const llmResult = computed(() => data.value?.llm_semantics ?? null);
+const llmValidated = computed(() => llmResult.value?.validated ?? null);
+const llmParamGroups = computed(() => {
+  const out: Record<string, number> = {};
+  for (const sem of llmValidated.value?.param_semantics ?? []) {
+    out[sem.group] = (out[sem.group] ?? 0) + 1;
+  }
+  return Object.entries(out).sort((a, b) => b[1] - a[1]);
+});
+const modulePlan = computed(() => data.value?.module_plan ?? []);
+const unityFeatures = computed(() => data.value?.unity_feature_summary ?? llmValidated.value?.unity_feature_summary ?? []);
+const modulePlanStats = computed(() => {
+  const entries = modulePlan.value;
+  return {
+    total: entries.length,
+    suggested: entries.filter((item) => item.suggested_by_unity).length,
+    active: entries.filter((item) => item.current_active).length,
+    probe: entries.filter((item) => item.probe_required).length,
+    searchParams: new Set(entries.flatMap((item) => item.search_params)).size,
+  };
+});
+
 function statusLabel(status: ParamMappingRow['status']): string {
   switch (status) {
     case 'manual': return 'manual';
@@ -143,13 +166,32 @@ function isOverridden(row: ParamMappingRow): boolean {
     row.unity_name,
   );
 }
+
+function percent(value: number | null | undefined): string {
+  if (typeof value !== 'number' || Number.isNaN(value)) return '—';
+  return `${(value * 100).toFixed(0)}%`;
+}
+
+function actionLabel(action: string): string {
+  switch (action) {
+    case 'optimize_group': return '直接优化';
+    case 'activate_gate_then_probe': return '激活后探针';
+    case 'probe_optional': return '可选探针';
+    case 'skip_low_confidence': return '低优先级';
+    default: return action || '—';
+  }
+}
 </script>
 
 <template>
   <div class="preanalysis-view">
     <header class="pa-head">
       <h2 class="section-title" style="margin: 0;">预分析</h2>
-      <span class="muted small">解析两侧 shader、生成参数映射、预测 stage 计划</span>
+      <span class="muted small">解析两侧 shader、生成语义先验、预测 stage 计划</span>
+      <label class="small llm-toggle">
+        <input type="checkbox" v-model="useLlm" />
+        启用 LLM 语义
+      </label>
       <button @click="rerun" :disabled="loading">{{ loading ? '运行中…' : data ? '重新分析' : '运行分析' }}</button>
     </header>
 
@@ -160,17 +202,84 @@ function isOverridden(row: ParamMappingRow): boolean {
       <section class="section">
         <h3 class="section-title">总览</h3>
         <div class="stats">
-          <span class="stat-pill">unity total <strong>{{ data.coverage.unity_total }}</strong></span>
-          <span class="stat-pill">unity mapped <strong>{{ data.coverage.unity_mapped }}</strong></span>
-          <span class="stat-pill">unity unmapped <strong>{{ data.coverage.unity_unmapped }}</strong></span>
-          <span class="stat-pill">laya total <strong>{{ data.coverage.laya_total }}</strong></span>
-          <span class="stat-pill">coverage <strong>{{ (data.coverage.ratio * 100).toFixed(1) }}%</strong></span>
+          <span class="stat-pill">Unity 功能 <strong>{{ unityFeatures.length }}</strong></span>
+          <span class="stat-pill">Laya 模块 <strong>{{ modulePlanStats.total }}</strong></span>
+          <span class="stat-pill">建议探索 <strong>{{ modulePlanStats.suggested }}</strong></span>
+          <span class="stat-pill">当前激活 <strong>{{ modulePlanStats.active }}</strong></span>
+          <span class="stat-pill">需探针 <strong>{{ modulePlanStats.probe }}</strong></span>
+          <span class="stat-pill">搜索参数 <strong>{{ modulePlanStats.searchParams }}</strong></span>
         </div>
         <p class="muted small" style="margin-top: 4px;">
           ran_at <span class="mono">{{ data.ran_at }}</span> ·
           unity shader <span class="mono">{{ data.unity_shader?.name ?? '(未提供)' }}</span> ·
           laya shader <span class="mono">{{ data.laya_shader.name }}</span>
         </p>
+      </section>
+
+      <section v-if="modulePlan.length" class="section">
+        <h3 class="section-title">模块搜索计划</h3>
+        <p class="muted small">
+          这里是预分析真正用于后续调参的结果：先识别 Unity 开启了哪些功能板块，再决定 Laya 哪些模块需要激活、探针或进入优化。
+        </p>
+        <div class="module-grid">
+          <article
+            v-for="entry in modulePlan"
+            :key="entry.group"
+            class="module-card"
+            :class="{ suggested: entry.suggested_by_unity, inactive: !entry.current_active }"
+          >
+            <div class="module-head">
+              <strong class="mono">{{ entry.group }}</strong>
+              <span class="status-pill" :class="entry.probe_required ? 'status-unity_only' : entry.suggested_by_unity ? 'status-curated' : 'status-laya_only'">
+                {{ actionLabel(entry.action) }}
+              </span>
+            </div>
+            <div class="stats compact">
+              <span class="stat-pill">priority <strong>{{ percent(entry.search_priority) }}</strong></span>
+              <span class="stat-pill">active <strong>{{ entry.current_active ? 'yes' : 'no' }}</strong></span>
+              <span class="stat-pill">params <strong>{{ entry.search_params.length }}/{{ entry.params_count }}</strong></span>
+            </div>
+            <p class="muted small">
+              Unity 功能：
+              <span class="mono">{{ entry.unity_features.join(', ') || '—' }}</span>
+            </p>
+            <p class="muted small">
+              gate:
+              <span class="mono">{{ [...entry.define_gates, ...entry.gate_params].join(', ') || '—' }}</span>
+            </p>
+            <code class="param-list">{{ entry.search_params.join(', ') || '—' }}</code>
+            <ul v-if="entry.evidence.length" class="evidence-list">
+              <li v-for="evidence in entry.evidence" :key="evidence">{{ evidence }}</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section v-if="unityFeatures.length" class="section">
+        <h3 class="section-title">Unity 功能模块摘要</h3>
+        <table class="mapping-table">
+          <thead>
+            <tr>
+              <th>功能</th>
+              <th>启用</th>
+              <th>置信度</th>
+              <th>候选 Laya 组</th>
+              <th>控制类型 / 证据</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="feature in unityFeatures" :key="feature.feature + feature.laya_candidate_groups.join(',')">
+              <td class="mono">{{ feature.feature }}</td>
+              <td>{{ feature.enabled ? 'yes' : 'no' }}</td>
+              <td>{{ percent(feature.confidence) }}</td>
+              <td class="mono small">{{ feature.laya_candidate_groups.join(', ') || '—' }}</td>
+              <td class="muted small">
+                <div>{{ feature.controls.join(', ') || '—' }}</div>
+                <div>{{ feature.evidence.slice(0, 2).join(' / ') }}</div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
       </section>
 
       <section v-if="data.warnings.length" class="section">
@@ -180,8 +289,88 @@ function isOverridden(row: ParamMappingRow): boolean {
         </ul>
       </section>
 
-      <section class="section">
-        <h3 class="section-title">参数映射</h3>
+      <section v-if="llmResult" class="section">
+        <h3 class="section-title">LLM 语义先验</h3>
+        <div class="stats">
+          <span class="stat-pill">status <strong>{{ llmResult.status }}</strong></span>
+          <span v-if="llmResult.runtime?.model" class="stat-pill">model <strong>{{ llmResult.runtime.model }}</strong></span>
+          <span v-if="llmValidated" class="stat-pill">features <strong>{{ unityFeatures.length }}</strong></span>
+          <span v-if="llmValidated" class="stat-pill">phenomena <strong>{{ llmValidated.unity_phenomena.length }}</strong></span>
+          <span v-if="llmValidated" class="stat-pill">semantics <strong>{{ llmValidated.param_semantics.length }}</strong></span>
+        </div>
+        <p v-if="llmResult.status === 'skipped'" class="muted small">{{ llmResult.reason }}</p>
+        <p v-else-if="llmResult.status === 'not_configured'" class="muted small">
+          未找到 OpenAI-compatible 配置：{{ llmResult.error }}
+        </p>
+        <p v-else-if="llmResult.status === 'failed'" class="error-text small">
+          LLM 调用失败：{{ llmResult.error }}
+        </p>
+        <p v-else-if="llmResult.status !== 'ok'" class="muted small">
+          LLM 未产出可用 Unity 功能模块，将只展示 Laya 侧 fallback 模块结构。
+        </p>
+        <template v-if="llmValidated">
+          <div v-if="llmValidated.unity_phenomena.length" class="phenomenon-grid">
+            <article
+              v-for="item in llmValidated.unity_phenomena"
+              :key="item.name + item.laya_candidate_groups.join(',')"
+              class="phenomenon-card"
+            >
+              <div class="phenomenon-title">
+                <strong>{{ item.name }}</strong>
+                <span class="status-pill status-fuzzy">{{ percent(item.confidence) }}</span>
+              </div>
+              <p class="muted small">{{ item.note || 'Unity 参数只作为视觉现象证据，不直接迁移数值。' }}</p>
+              <p class="muted small">
+                候选 Laya 组：
+                <span v-if="item.laya_candidate_groups.length" class="mono">{{ item.laya_candidate_groups.join(', ') }}</span>
+                <span v-else>—</span>
+              </p>
+              <ul v-if="item.unity_evidence.length" class="evidence-list">
+                <li v-for="evidence in item.unity_evidence" :key="evidence">{{ evidence }}</li>
+              </ul>
+            </article>
+          </div>
+          <div v-if="llmParamGroups.length" class="semantic-groups">
+            <span
+              v-for="[group, count] in llmParamGroups"
+              :key="group"
+              class="stat-pill"
+            >{{ group }} <strong>{{ count }}</strong></span>
+          </div>
+          <table v-if="llmValidated.initial_laya_param_suggestions.length" class="rec-table">
+            <thead>
+              <tr>
+                <th>初始参考参数</th>
+                <th>建议值</th>
+                <th>置信度</th>
+                <th>Unity 证据</th>
+                <th>原因</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="suggestion in llmValidated.initial_laya_param_suggestions" :key="suggestion.laya_param">
+                <td class="mono">{{ suggestion.laya_param }}</td>
+                <td class="mono small">{{ JSON.stringify(suggestion.suggested_value) }}</td>
+                <td>{{ percent(suggestion.confidence) }}</td>
+                <td class="mono small">{{ suggestion.source_unity_params.join(', ') || '—' }}</td>
+                <td class="muted small">{{ suggestion.reason }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <ul v-if="(llmResult.warnings?.length ?? 0) > 0" class="warning-list">
+            <li v-for="warning in llmResult.warnings" :key="warning">{{ warning }}</li>
+          </ul>
+        </template>
+      </section>
+
+      <details class="section debug-section">
+        <summary>
+          <span class="section-title">参数映射（人工参考）</span>
+          <span class="muted small">旧表仅用于查漏补缺，不再作为预分析主结论。</span>
+        </summary>
+        <ul v-if="data.mapping_notes?.length" class="warning-list">
+          <li v-for="note in data.mapping_notes" :key="note">{{ note }}</li>
+        </ul>
         <p class="muted small" style="margin: 0 0 6px;">
           流水线优先级：<span class="kbd">manual</span> ▸ <span class="kbd">curated 字典</span> ▸ <span class="kbd">归一化精确</span> ▸ <span class="kbd">类型兼容的 fuzzy ≥0.85</span>。
           类型不兼容（Range vs Color 之类）一律拒绝。任何一行点"改一下"都可以手动覆盖，存到 <span class="mono">project.json.manual_param_mapping</span>。
@@ -247,11 +436,11 @@ function isOverridden(row: ParamMappingRow): boolean {
           </tbody>
         </table>
         <p v-if="!rows.length" class="muted small">没有匹配的行。</p>
-      </section>
+      </details>
 
       <section v-if="data.initial_recommendations.length" class="section">
-        <h3 class="section-title">初值建议（Unity → Laya）</h3>
-        <p class="muted small">直接把 Unity 的实际参数复制到 Laya 的对应通道，作为调参的起点。仅显示已有 mapping 且 Unity 有值的项。</p>
+        <h3 class="section-title">旧版初值参考（Unity → Laya）</h3>
+        <p class="muted small">这些来自传统参数映射，只能作为人工参考；Unity 与 Laya 数值通常不等价，不应把它当作最终参数答案。</p>
         <table class="rec-table">
           <thead>
             <tr>
@@ -296,8 +485,32 @@ function isOverridden(row: ParamMappingRow): boolean {
 <style scoped>
 .preanalysis-view { display: flex; flex-direction: column; gap: 12px; padding-bottom: 24px; }
 .pa-head { display: flex; align-items: baseline; gap: 12px; }
+.llm-toggle { display: inline-flex; align-items: center; gap: 4px; color: var(--text-muted); }
 .stats { display: flex; gap: 8px; flex-wrap: wrap; }
+.stats.compact { gap: 4px; margin: 6px 0; }
 .warning-list { margin: 4px 0 0; padding-left: 22px; color: var(--warn); }
+.error-text { color: var(--bad); }
+.module-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 10px; margin-top: 8px; }
+.module-card {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+}
+.module-card.suggested { border-color: rgba(63, 185, 80, 0.55); }
+.module-card.inactive { background: rgba(210, 153, 34, 0.04); }
+.module-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.phenomenon-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px; margin-top: 8px; }
+.phenomenon-card {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+}
+.phenomenon-title { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+.evidence-list { margin: 6px 0 0; padding-left: 18px; color: var(--text-muted); font-size: 12px; }
+.semantic-groups { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+.debug-section summary { cursor: pointer; display: flex; align-items: baseline; gap: 8px; }
 .filter-row { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 6px; }
 .filter-row button.active { background: var(--bg-hover); color: var(--accent); border-color: var(--accent); }
 .mapping-table, .rec-table { width: 100%; border-collapse: collapse; font-size: 12px; }

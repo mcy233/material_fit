@@ -52,6 +52,8 @@ from typing import Any, Iterable, Sequence
 import numpy as np
 
 from ..shared.models import ShaderParam
+from .effective_bounds import effective_bounds_for_param
+from .semantic_graph import ParamSemantics, ShaderEffectGraph
 
 
 JsonValue = float | int | bool | list[float | int | bool]
@@ -91,7 +93,6 @@ _NAME_BLACKLIST = {
 }
 _NAME_SUFFIX_BLACKLIST = ("_st",)
 
-
 def _is_texture_type(param: ShaderParam) -> bool:
     return str(param.param_type).strip().lower() in _TEXTURE_PARAM_TYPES
 
@@ -103,11 +104,35 @@ def _is_blacklisted_name(name: str) -> bool:
     return any(lower.endswith(suffix) for suffix in _NAME_SUFFIX_BLACKLIST)
 
 
+def _param_semantics_map(
+    semantics: ShaderEffectGraph | dict[str, ParamSemantics] | None,
+) -> dict[str, ParamSemantics]:
+    if semantics is None:
+        return {}
+    if isinstance(semantics, ShaderEffectGraph):
+        return dict(semantics.params)
+    return dict(semantics)
+
+
+def _axis_transform(
+    semantic: ParamSemantics | None,
+    name: str,
+    param: ShaderParam | None,
+) -> str:
+    if semantic is not None and semantic.transform:
+        return semantic.transform
+    if param is not None and str(param.param_type).strip().lower() == "color":
+        return "color_rgb"
+    return "linear"
+
+
 # Default bounds inferred from param-name keywords. Mirrors
 # ``adjustment_algorithm._clamp_number`` so we don't run two clamp
 # policies that disagree.
 def _default_bounds(name: str, value: float) -> tuple[float, float]:
     lower = name.lower()
+    if (bounds := effective_bounds_for_param(name)) is not None:
+        return bounds
     low = -math.inf
     high = math.inf
     if any(token in lower for token in ("intensity", "strength", "scale")):
@@ -153,6 +178,7 @@ class _AxisSpec:
     initial: float
     is_color: bool = False    # alpha (sub_index=3) of color is *not* an
                               # axis; this flag is for documentation
+    transform: str = "linear"
 
 
 class ParameterEncoder:
@@ -171,8 +197,10 @@ class ParameterEncoder:
         shader_params: Sequence[ShaderParam],
         *,
         param_whitelist: Iterable[str] | None = None,
+        semantics: ShaderEffectGraph | dict[str, ParamSemantics] | None = None,
     ) -> None:
         self._param_info = {p.name: p for p in shader_params}
+        self._semantics = _param_semantics_map(semantics)
         self._fixed: ParamDict = {}
         self._axes: list[_AxisSpec] = []
         # alpha-of-color values, indexed by param name (we round-trip them
@@ -185,6 +213,10 @@ class ParameterEncoder:
                 self._fixed[name] = value
                 continue
             param = self._param_info.get(name)
+            semantic = self._semantics.get(name)
+            if semantic is not None and not semantic.searchable:
+                self._fixed[name] = value
+                continue
             if param is not None and _is_texture_type(param):
                 self._fixed[name] = value
                 continue
@@ -199,10 +231,20 @@ class ParameterEncoder:
                 self._fixed[name] = value
                 continue
             if isinstance(value, (int, float)):
-                low, high = self._scalar_bounds(name, float(value), param)
-                initial = self._clamp(float(value), low, high)
+                low, high = self._scalar_bounds(name, float(value), param, semantic)
+                transform = _axis_transform(semantic, name, param)
+                low_t, high_t, initial_t, transform = self._transform_bounds(
+                    low, high, float(value), transform
+                )
                 self._axes.append(
-                    _AxisSpec(param_name=name, sub_index=-1, low=low, high=high, initial=initial)
+                    _AxisSpec(
+                        param_name=name,
+                        sub_index=-1,
+                        low=low_t,
+                        high=high_t,
+                        initial=initial_t,
+                        transform=transform,
+                    )
                 )
                 continue
             if isinstance(value, list) and len(value) in (3, 4) and all(isinstance(x, (int, float)) for x in value):
@@ -214,16 +256,20 @@ class ParameterEncoder:
                     self._alpha[name] = float(value[3])
                 for sub_idx in range(effective_len):
                     sub_value = float(value[sub_idx])
-                    low, high = self._sub_bounds(name, sub_idx, sub_value, param, is_color)
-                    initial = self._clamp(sub_value, low, high)
+                    low, high = self._sub_bounds(name, sub_idx, sub_value, param, is_color, semantic)
+                    transform = "linear" if is_color else _axis_transform(semantic, name, param)
+                    low_t, high_t, initial_t, transform = self._transform_bounds(
+                        low, high, sub_value, transform
+                    )
                     self._axes.append(
                         _AxisSpec(
                             param_name=name,
                             sub_index=sub_idx,
-                            low=low,
-                            high=high,
-                            initial=initial,
+                            low=low_t,
+                            high=high_t,
+                            initial=initial_t,
                             is_color=is_color,
+                            transform=transform,
                         )
                     )
                 continue
@@ -270,7 +316,7 @@ class ParameterEncoder:
                 if not isinstance(value, (int, float)):
                     out[i] = axis.initial
                 else:
-                    out[i] = self._clamp(float(value), axis.low, axis.high)
+                    out[i] = self._encode_axis_value(float(value), axis)
             else:
                 if not isinstance(value, list) or axis.sub_index >= len(value):
                     out[i] = axis.initial
@@ -279,7 +325,7 @@ class ParameterEncoder:
                     if not isinstance(sub, (int, float)):
                         out[i] = axis.initial
                     else:
-                        out[i] = self._clamp(float(sub), axis.low, axis.high)
+                        out[i] = self._encode_axis_value(float(sub), axis)
         return out
 
     def decode(self, vector: np.ndarray) -> ParamDict:
@@ -297,7 +343,7 @@ class ParameterEncoder:
         list_buffers: dict[str, list[float]] = {}
         list_is_color: dict[str, bool] = {}
         for i, axis in enumerate(self._axes):
-            value = self._clamp(float(vector[i]), axis.low, axis.high)
+            value = self._decode_axis_value(float(vector[i]), axis)
             if axis.sub_index < 0:
                 out[axis.param_name] = value
             else:
@@ -324,7 +370,50 @@ class ParameterEncoder:
             return 0.5 * (low + high)
         return max(low, min(high, x))
 
-    def _scalar_bounds(self, name: str, value: float, param: ShaderParam | None) -> tuple[float, float]:
+    def _transform_bounds(
+        self,
+        low: float,
+        high: float,
+        initial: float,
+        transform: str,
+    ) -> tuple[float, float, float, str]:
+        initial = self._clamp(initial, low, high)
+        if transform == "log" and low > -1.0 and high > low:
+            low_t = math.log1p(low)
+            high_t = math.log1p(high)
+            return low_t, high_t, self._clamp(math.log1p(initial), low_t, high_t), "log"
+        return low, high, initial, "linear" if transform == "log" else transform
+
+    def _encode_axis_value(self, value: float, axis: _AxisSpec) -> float:
+        if axis.transform == "log":
+            value = max(value, -0.999999)
+            return self._clamp(math.log1p(value), axis.low, axis.high)
+        return self._clamp(value, axis.low, axis.high)
+
+    def _decode_axis_value(self, value: float, axis: _AxisSpec) -> float:
+        value = self._clamp(value, axis.low, axis.high)
+        if axis.transform == "log":
+            return math.expm1(value)
+        if axis.transform == "circular":
+            width = axis.high - axis.low
+            if width > 0:
+                return axis.low + ((value - axis.low) % width)
+        return value
+
+    def _scalar_bounds(
+        self,
+        name: str,
+        value: float,
+        param: ShaderParam | None,
+        semantic: ParamSemantics | None = None,
+    ) -> tuple[float, float]:
+        if (bounds := effective_bounds_for_param(name)) is not None:
+            return bounds
+        if semantic is not None:
+            low = float(semantic.range_min) if semantic.range_min is not None else -math.inf
+            high = float(semantic.range_max) if semantic.range_max is not None else math.inf
+            if math.isfinite(low) and math.isfinite(high) and low < high:
+                return low, high
         if param is not None:
             low = float(param.range_min) if param.range_min is not None else -math.inf
             high = float(param.range_max) if param.range_max is not None else math.inf
@@ -347,11 +436,12 @@ class ParameterEncoder:
         value: float,
         param: ShaderParam | None,
         is_color: bool,
+        semantic: ParamSemantics | None = None,
     ) -> tuple[float, float]:
         if is_color:
             return 0.0, 1.0
         # Vector but not color: fall back to scalar bounds policy.
-        return self._scalar_bounds(f"{name}[{sub_idx}]", value, param)
+        return self._scalar_bounds(f"{name}[{sub_idx}]", value, param, semantic)
 
     @staticmethod
     def _looks_like_color(name: str, param: ShaderParam | None, length: int) -> bool:

@@ -118,16 +118,14 @@ class ProbeConfig:
     probe_param: str = "u_BaseColor"
     probe_value: tuple[float, float, float, float] = (1.0, 0.0, 1.0, 1.0)
 
-    mean_diff_change_threshold: float = 1.5
+    mean_diff_change_threshold: float = 0.5
     """Minimum mean per-pixel L1 colour distance (in [0, 255]) between
     baseline and probe captures, for the probe to be considered
     'visibly different' from the baseline.
 
-    Tuning: 0 means literally identical frames (Laya frozen). PNG/JPEG
-    re-encoding artefacts can produce 0.3-0.8 even for the *same*
-    rendered frame. A 1.5 threshold leaves comfortable headroom over
-    that noise floor; in practice, even a tiny change to ``u_BaseColor``
-    on a textured surface produces 4-30 mean diff."""
+    Tuning: 0 means any non-identical frame counts as a refresh. The
+    default 0.5 only filters out tiny capture noise while still accepting
+    weak material changes diluted by full-frame background pixels."""
 
     mean_diff_restore_threshold: float = 2.5
     """Maximum mean per-pixel L1 colour distance (in [0, 255]) between
@@ -338,22 +336,21 @@ def run_refresh_probe(
     # Hue-agnostic, robust to textured/PBR materials where strict
     # "fraction of pure-magenta pixels" stays near zero even when Laya
     # clearly refreshed.
-    detected_change = diff_bp >= config.mean_diff_change_threshold
+    detected_change = diff_bp > config.mean_diff_change_threshold
     detected_restore = diff_br <= config.mean_diff_restore_threshold
     success = detected_change and detected_restore
 
     # Frozen-Laya detection: all three captures are essentially identical
-    # (within noise floor). When that happens, ``detected_restore`` will
-    # accidentally pass (because restored == baseline == probe), so we
-    # special-case this *before* the standard branches to give the user
-    # the right diagnosis.
-    noise_floor = max(config.mean_diff_change_threshold, 0.5)
+    # (within the capture noise floor). Keep this independent from the
+    # user-configurable pass threshold; otherwise a weak-but-real probe
+    # signal gets mislabeled as "not refreshing".
+    noise_floor = 0.5
     frozen = diff_bp < noise_floor and diff_pr < noise_floor and diff_br < noise_floor
 
     if success:
         reason = (
             f"Laya did refresh: mean color diff baseline→probe = {diff_bp:.2f} "
-            f"(≥ {config.mean_diff_change_threshold:.2f}), and restored is back "
+            f"(> {config.mean_diff_change_threshold:.2f}), and restored is back "
             f"close to baseline (diff = {diff_br:.2f}, ≤ {config.mean_diff_restore_threshold:.2f}). "
             f"Magenta-ratio side-signal: {baseline_magenta:.2%} → {probe_magenta:.2%} "
             f"→ {restored_magenta:.2%}."
@@ -370,12 +367,11 @@ def run_refresh_probe(
         )
     elif not detected_change:
         reason = (
-            f"Probe write did not visibly change the frame "
-            f"(mean diff baseline→probe = {diff_bp:.2f}, threshold "
-            f"{config.mean_diff_change_threshold:.2f}). The probe param "
-            f"{config.probe_param!r} might be overridden by another "
-            f"uniform/define, or the capture region missed the model. "
-            f"baseline→restored diff was {diff_br:.2f}."
+            f"Probe write did not produce enough color difference "
+            f"(mean diff baseline→probe = {diff_bp:.2f}, required > "
+            f"{config.mean_diff_change_threshold:.2f}). Set "
+            f"mean_diff_change_threshold to 0 if any non-zero difference "
+            f"should count as a refresh. baseline→restored diff was {diff_br:.2f}."
         )
     else:
         reason = (

@@ -277,6 +277,33 @@ def test_combine_fit_score_falls_back_to_mae_only_when_ssim_missing():
     assert math.isclose(fit, components["mae_branch"], abs_tol=1e-9)
 
 
+def test_combine_fit_score_mae_branch_does_not_saturate_after_p0():
+    """Phase summary 2026-05-08 P0 regression: at high MAE the legacy
+    ``1 - sqrt(4·MAE)`` mapping clipped to zero, killing the
+    optimizer's gradient. The new ``exp(-k·MAE)`` mapping must stay
+    strictly positive and strictly decreasing well past the old
+    saturation point so cold-start runs (fish_1580 had MAE≈0.33)
+    still receive a meaningful signal.
+    """
+
+    fit_at_zero, comps_zero = ps.combine_fit_score(weighted_mae=0.0, ssim=0.0)
+    fit_at_quarter, comps_quarter = ps.combine_fit_score(weighted_mae=0.25, ssim=0.0)
+    fit_at_third, comps_third = ps.combine_fit_score(weighted_mae=0.33, ssim=0.0)
+    fit_at_half, comps_half = ps.combine_fit_score(weighted_mae=0.50, ssim=0.0)
+
+    assert comps_zero["mae_branch"] == 1.0
+    assert comps_quarter["mae_branch"] > 0.05
+    assert comps_third["mae_branch"] > 0.05
+    assert comps_half["mae_branch"] > 0.05
+    assert comps_third["mae_branch"] < comps_quarter["mae_branch"]
+    assert comps_half["mae_branch"] < comps_third["mae_branch"]
+    assert comps_zero["mae_branch_saturated"] is False
+    assert comps_third["mae_branch_saturated"] is False
+    assert comps_third["legacy_mae_branch_saturated"] is True
+    assert comps_third["mae_mapping"] == "exp_decay"
+    assert fit_at_zero > fit_at_quarter > fit_at_third > fit_at_half
+
+
 # ---------------------------------------------------------------------
 # diff_analysis integration
 # ---------------------------------------------------------------------
@@ -311,6 +338,15 @@ def test_analyze_image_diff_emits_e009_blocks(tmp_path):
     assert "ssim" in perc
     assert "fit_score" in perc
     assert "weights_used" in perc
+    assert "human_accept_score" in res
+    assert isinstance(res["human_accept_score"], float)
+    assert 0.0 <= res["human_accept_score"] <= 1.0
+    assert res["human_accept"]["metric"] in {
+        "human_accept_material_score_v1",
+        "human_accept_material_score_v2",
+    }
+    assert "foreground_color_distribution" in res["human_accept"]["components"]
+    assert "foreground_bbox_alignment" in res["human_accept"]["components"]
 
 
 def test_analyze_image_diff_respects_explicit_mask(tmp_path):
@@ -353,6 +389,16 @@ def test_resolve_fit_score_prefers_perceptual_fit_score():
     }
     res = _resolve_fit_score(analysis, diff_score=0.20, mode="perceptual")
     assert math.isclose(res, 0.42, abs_tol=1e-9)
+
+
+def test_resolve_fit_score_prefers_human_accept_score():
+    analysis = {
+        "score": 0.20,
+        "perceptual_fit_score": 0.42,
+        "human_accept_score": 0.67,
+    }
+    res = _resolve_fit_score(analysis, diff_score=0.20, mode="human_accept")
+    assert math.isclose(res, 0.67, abs_tol=1e-9)
 
 
 def test_resolve_fit_score_falls_back_when_perceptual_missing():

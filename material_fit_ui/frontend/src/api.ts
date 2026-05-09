@@ -6,36 +6,13 @@ import type {
   IterationDetail,
   IterationSummary,
   JobState,
+  LayaControlSchemaPresetList,
   PreanalysisPayload,
   PreflightResult,
   ProjectDetail,
   ProjectSummary,
 } from './types';
-
-async function getJson<T>(url: string): Promise<T> {
-  const response = await fetch(url, { headers: { Accept: 'application/json' } });
-  if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(`GET ${url} failed: ${response.status} ${response.statusText} ${text}`);
-  }
-  return (await response.json()) as T;
-}
-
-async function sendJson<T>(url: string, method: string, body?: unknown): Promise<T> {
-  const response = await fetch(url, {
-    method,
-    headers: {
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-    },
-    body: body == null ? '{}' : JSON.stringify(body),
-  });
-  if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(`${method} ${url} failed: ${response.status} ${response.statusText} ${text}`);
-  }
-  return (await response.json()) as T;
-}
+import { getJson, sendJson } from './api/client';
 
 export function fetchCases(): Promise<CaseSummary[]> {
   return getJson<CaseSummary[]>('/api/cases');
@@ -152,10 +129,14 @@ export function externalPreviewUrl(path: string): string {
 // Preanalysis
 // ============================================================================
 
-export function runPreanalysis(projectId: string): Promise<PreanalysisPayload> {
+export function runPreanalysis(
+  projectId: string,
+  options: { use_llm?: boolean } = {},
+): Promise<PreanalysisPayload> {
   return sendJson<PreanalysisPayload>(
     `/api/projects/${encodeURIComponent(projectId)}/preanalyze`,
     'POST',
+    options,
   );
 }
 
@@ -171,7 +152,11 @@ export function fetchPreanalysis(projectId: string): Promise<PreanalysisPayload>
 
 export function runLayaRefreshPreflight(
   projectId: string,
-  options: { probe_param?: string } = {},
+  options: {
+    probe_param?: string;
+    mean_diff_change_threshold?: number;
+    mean_diff_restore_threshold?: number;
+  } = {},
 ): Promise<PreflightResult> {
   return sendJson<PreflightResult>(
     `/api/projects/${encodeURIComponent(projectId)}/preflight/laya_refresh`,
@@ -204,6 +189,67 @@ export function setManualMapping(
     `/api/projects/${encodeURIComponent(projectId)}/manual_mapping`,
     'PUT',
     { manual_param_mapping: mapping },
+  );
+}
+
+export function saveLayaControlSchema(
+  projectId: string,
+  manualSchema: Record<string, unknown>,
+): Promise<PreanalysisPayload> {
+  return sendJson<PreanalysisPayload>(
+    `/api/projects/${encodeURIComponent(projectId)}/laya_control_schema`,
+    'PUT',
+    { manual_laya_control_schema: manualSchema },
+  );
+}
+
+export function fetchLayaControlSchemaPresets(projectId: string): Promise<LayaControlSchemaPresetList> {
+  return getJson<LayaControlSchemaPresetList>(
+    `/api/projects/${encodeURIComponent(projectId)}/laya_control_schema_presets`,
+  );
+}
+
+export function applyLayaControlSchemaPreset(
+  projectId: string,
+  presetId: string,
+): Promise<PreanalysisPayload> {
+  return sendJson<PreanalysisPayload>(
+    `/api/projects/${encodeURIComponent(projectId)}/laya_control_schema_presets/apply`,
+    'POST',
+    { preset_id: presetId },
+  );
+}
+
+export function saveLayaControlSchemaPreset(
+  projectId: string,
+  payload: { name: string; description?: string },
+): Promise<LayaControlSchemaPresetList> {
+  return sendJson<LayaControlSchemaPresetList>(
+    `/api/projects/${encodeURIComponent(projectId)}/laya_control_schema_presets`,
+    'POST',
+    payload,
+  );
+}
+
+export function renameLayaControlSchemaPreset(
+  projectId: string,
+  presetId: string,
+  payload: { name: string; description?: string },
+): Promise<LayaControlSchemaPresetList> {
+  return sendJson<LayaControlSchemaPresetList>(
+    `/api/projects/${encodeURIComponent(projectId)}/laya_control_schema_presets/${encodeURIComponent(presetId)}`,
+    'PUT',
+    payload,
+  );
+}
+
+export function deleteLayaControlSchemaPreset(
+  projectId: string,
+  presetId: string,
+): Promise<LayaControlSchemaPresetList> {
+  return sendJson<LayaControlSchemaPresetList>(
+    `/api/projects/${encodeURIComponent(projectId)}/laya_control_schema_presets/${encodeURIComponent(presetId)}`,
+    'DELETE',
   );
 }
 

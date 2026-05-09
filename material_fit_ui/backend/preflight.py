@@ -43,6 +43,8 @@ def run_laya_refresh_preflight(
     *,
     config: LoaderConfig | None = None,
     probe_param: str = "u_BaseColor",
+    mean_diff_change_threshold: float | None = None,
+    mean_diff_restore_threshold: float | None = None,
 ) -> dict[str, Any]:
     """Run the magenta-probe preflight against the project's real .lmat
     and persist the verdict at ``output/<project>/preflight/last.json``.
@@ -126,11 +128,27 @@ def run_laya_refresh_preflight(
         return Path(result["output_path"])
 
     rerender_wait_ms = int(algo.get("rerender_wait_ms", 1500))
+    probe_cfg = algo.get("laya_refresh_probe") if isinstance(algo.get("laya_refresh_probe"), dict) else {}
+    change_threshold = _coerce_threshold(
+        mean_diff_change_threshold,
+        probe_cfg.get("mean_diff_change_threshold"),
+        0.5,
+    )
+    restore_threshold = _coerce_threshold(
+        mean_diff_restore_threshold,
+        probe_cfg.get("mean_diff_restore_threshold"),
+        2.5,
+    )
     focus_callback = _build_focus_callback(inputs)
     probe = run_refresh_probe(
         laya_material_path=laya_material_path,
         capture=_capture,
-        config=ProbeConfig(probe_param=probe_param, rerender_wait_ms=rerender_wait_ms),
+        config=ProbeConfig(
+            probe_param=probe_param,
+            rerender_wait_ms=rerender_wait_ms,
+            mean_diff_change_threshold=change_threshold,
+            mean_diff_restore_threshold=restore_threshold,
+        ),
         output_dir=preflight_dir,
         focus=focus_callback,
     )
@@ -216,6 +234,19 @@ def _build_focus_callback(inputs: dict[str, Any]):
         return result
 
     return _focus
+
+
+def _coerce_threshold(*values: Any) -> float:
+    for value in values:
+        if value is None or value == "":
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed >= 0.0:
+            return parsed
+    return 0.0
 
 
 def _json_dump(data: Any) -> str:

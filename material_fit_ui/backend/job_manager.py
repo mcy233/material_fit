@@ -21,6 +21,7 @@ import json
 import os
 import secrets
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -92,6 +93,7 @@ def start_job(
         if existing and existing.get("status") == "running":
             raise RuntimeError(f"project {project_id} already has running job {existing['job_id']}")
 
+    _clear_previous_iteration_outputs(paths.project_dir)
     fit_config_path = write_fit_config(project_id, config)
     fit_config = derive_fit_config(project_id, config)
 
@@ -104,6 +106,8 @@ def start_job(
     optimizer_value_for_default = str(algo.get("optimizer", "heuristic")).strip().lower()
     if optimizer_value_for_default in ("cma_cold", "cma_warm"):
         default_iterations = 30
+    elif optimizer_value_for_default == "semantic_group":
+        default_iterations = 12
     else:
         default_iterations = 6
     args = [
@@ -147,7 +151,7 @@ def start_job(
     # 'heuristic' value matches fit_material.py's own default, so old
     # projects without these fields still work unchanged.
     optimizer_value = str(algo.get("optimizer", "heuristic")).strip().lower()
-    if optimizer_value not in ("heuristic", "cma_cold", "cma_warm"):
+    if optimizer_value not in ("heuristic", "cma_cold", "cma_warm", "semantic_group"):
         optimizer_value = "heuristic"
     args.extend(["--optimizer", optimizer_value])
 
@@ -227,6 +231,30 @@ def start_job(
     )
     watcher.start()
     return job.to_dict()
+
+
+def _clear_previous_iteration_outputs(project_dir: Path) -> None:
+    """Reset per-run iteration artifacts before launching a new job.
+
+    Job history remains under ``jobs/``; only the files that drive the
+    timeline/detail UI are removed so every new auto-adjust run starts
+    from ``iter_0000`` visually and analytically.
+    """
+
+    auto_dir = project_dir / "auto_adjust"
+    if auto_dir.exists():
+        for entry in auto_dir.iterdir():
+            if entry.is_dir() and entry.name.startswith("iter_"):
+                shutil.rmtree(entry, ignore_errors=True)
+        for name in ("state.json", "auto_adjust_result.json"):
+            target = auto_dir / name
+            if target.exists():
+                target.unlink()
+    iter_dir = project_dir / "iterations"
+    if iter_dir.exists():
+        for entry in iter_dir.iterdir():
+            if entry.is_dir() and entry.name.startswith("iter_"):
+                shutil.rmtree(entry, ignore_errors=True)
 
 
 def list_jobs(project_id: str, config: LoaderConfig | None = None) -> list[dict[str, Any]]:
@@ -382,11 +410,16 @@ def _summarize_decision(path: Path) -> dict[str, Any] | None:
     if not isinstance(data, dict):
         return None
     inner = data.get("decision") if isinstance(data.get("decision"), dict) else {}
+    perceptual = data.get("perceptual_signals") if isinstance(data.get("perceptual_signals"), dict) else {}
+    human = perceptual.get("human_accept") if isinstance(perceptual.get("human_accept"), dict) else {}
     return {
         "iteration": data.get("iteration"),
         "selected_stage": data.get("selected_stage"),
         "fit_score_before": data.get("fit_score_before"),
         "diff_score_before": data.get("diff_score_before"),
+        "human_accept_score": human.get("score"),
+        "perceptual_fit_score": perceptual.get("fit_score"),
+        "weighted_mae": perceptual.get("weighted_mae"),
         "stop_reason": inner.get("stop_reason"),
         "changes_count": len(inner.get("changes") or []) if isinstance(inner.get("changes"), list) else 0,
         "optimizer": inner.get("optimizer"),

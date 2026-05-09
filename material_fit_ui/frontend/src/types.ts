@@ -57,6 +57,7 @@ export interface AdjustmentPolicy {
 export interface ShaderInfoPayload {
   path: string;
   name: string;
+  source_excerpt?: string;
   params: Array<{
     name: string;
     param_type: string;
@@ -161,6 +162,10 @@ export interface DiffAnalysis {
   regions: Record<string, Record<string, unknown>>;
   material_channels: Record<string, MaterialChannel | CenterEdgeBalance>;
   adjustment_hints?: AdjustmentHint[];
+  perceptual_fit_score?: number;
+  human_accept_score?: number;
+  human_accept?: Record<string, unknown>;
+  perceptual?: Record<string, unknown>;
   report_path?: string;
 }
 
@@ -264,7 +269,8 @@ export interface ProjectInputs {
   laya_capture_anchor?: LayaCaptureAnchor;
 }
 
-export type FitScoreMode = 'linear' | 'perceptual';
+export type FitScoreMode = 'linear' | 'perceptual' | 'human_accept';
+export type AutoAdjustMode = 'fresh_fit' | 'refine_current';
 
 // E-007 (ExperimentLog.md): magenta-probe preflight result.
 // Mirrors ProbeResult.to_dict() in tools/material_fit/laya/refresh_probe.py.
@@ -307,7 +313,12 @@ export interface PreflightResult {
   last_path?: string;
 }
 
-export type OptimizerKind = 'heuristic' | 'cma_cold' | 'cma_warm';
+export interface LayaRefreshProbeConfig {
+  mean_diff_change_threshold: number;
+  mean_diff_restore_threshold: number;
+}
+
+export type OptimizerKind = 'heuristic' | 'cma_cold' | 'cma_warm' | 'semantic_group';
 
 export interface CmaEsConfig {
   // mode is informational; the active mode is encoded by OptimizerKind
@@ -327,6 +338,10 @@ export interface CmaEsConfig {
   hint_bias_mix_ratio: number;
 }
 
+export interface LayaControlGroupOverride {
+  enabled: boolean;
+}
+
 export interface AlgorithmConfig {
   max_iterations: number;
   target_score: number;
@@ -336,8 +351,11 @@ export interface AlgorithmConfig {
   use_capture_contract: boolean;
   dry_run: boolean;
   fit_score_mode: FitScoreMode;
+  auto_adjust_mode?: AutoAdjustMode;
+  laya_refresh_probe?: LayaRefreshProbeConfig;
   optimizer: OptimizerKind;
   cma_es: CmaEsConfig;
+  laya_control_group_overrides?: Record<string, LayaControlGroupOverride>;
 }
 
 export interface LlmConfig {
@@ -375,6 +393,9 @@ export interface ProjectDetail {
   active_job_id: string | null;
   last_job_id: string | null;
   manual_param_mapping?: Record<string, string>;
+  manual_laya_control_schema?: ManualLayaControlSchema;
+  active_laya_control_schema_preset_id?: string;
+  laya_control_schema_presets?: LayaControlSchemaPreset[];
   _summary?: ProjectSummary;
 }
 
@@ -412,9 +433,199 @@ export interface ParamRecommendation {
   unity_param: string;
   current_laya_value: unknown;
   suggested_value: unknown;
-  status: 'exact' | 'fuzzy';
+  status: 'manual' | 'curated' | 'exact' | 'fuzzy';
   type: string | null;
   range: [number | null, number | null];
+}
+
+export interface UnityPhenomenon {
+  name: string;
+  confidence: number;
+  unity_evidence: string[];
+  laya_candidate_groups: string[];
+  note: string;
+}
+
+export interface UnityFeatureSummary {
+  feature: string;
+  enabled: boolean;
+  confidence: number;
+  evidence: string[];
+  unity_params: string[];
+  textures: string[];
+  controls: string[];
+  laya_candidate_groups: string[];
+  risk: string;
+}
+
+export interface LayaModuleCandidate {
+  feature: string;
+  group: string;
+  confidence: number;
+  params: string[];
+  define_gates: string[];
+  param_gates: string[];
+  reason: string;
+}
+
+export interface ModulePlanEntry {
+  group: string;
+  unity_features: string[];
+  current_active: boolean;
+  suggested_by_unity: boolean;
+  probe_required: boolean;
+  search_priority: number;
+  action: string;
+  params_count: number;
+  search_params: string[];
+  gate_params: string[];
+  define_gates: string[];
+  channels: string[];
+  evidence: string[];
+  reason: string;
+}
+
+export interface LayaControlGateStatus {
+  state: 'open' | 'blocked' | string;
+  closed: string[];
+  open: string[];
+}
+
+export interface LayaShaderControl {
+  name: string;
+  display_name: string;
+  param_type: string;
+  current_value: unknown;
+  default: unknown;
+  range: [number | null, number | null];
+  hidden: string | null;
+  group: string;
+  role: string;
+  transform: string;
+  searchable: boolean;
+  is_gate: boolean;
+  is_search_param: boolean;
+  gates: Array<{ kind: string; name: string; expected?: unknown; reason?: string }>;
+  gate_status: LayaControlGateStatus;
+  dependencies: string[];
+  reason: string;
+  source?: string;
+  locked_fields?: string[];
+  note?: string;
+}
+
+export interface LayaControlGroup {
+  group: string;
+  label: string;
+  description: string;
+  current_active: boolean;
+  suggested_by_unity: boolean;
+  probe_required: boolean;
+  search_priority: number;
+  reason: string;
+  channels: string[];
+  define_gates: string[];
+  gate_params: string[];
+  controls: LayaShaderControl[];
+  searchable_count: number;
+  gate_count: number;
+  enabled?: boolean;
+  locked?: boolean;
+  order?: number;
+  source?: string;
+}
+
+export interface LayaControlSchemaGroup {
+  id: string;
+  label: string;
+  description: string;
+  enabled: boolean;
+  locked: boolean;
+  order: number;
+  current_active: boolean;
+  suggested_by_unity: boolean;
+  probe_required: boolean;
+  search_priority: number;
+  reason: string;
+  channels: string[];
+  define_gates: string[];
+  gate_params: string[];
+  controls: LayaShaderControl[];
+  source?: string;
+}
+
+export interface ManualLayaControlSchema {
+  schema_version: number;
+  base_auto_hash: string;
+  groups: Record<string, Record<string, unknown>>;
+  controls: Record<string, Record<string, unknown>>;
+  deleted_groups: string[];
+  hidden_controls: string[];
+}
+
+export interface LayaControlSchema {
+  schema_version: number;
+  source?: Record<string, unknown>;
+  groups: LayaControlSchemaGroup[];
+  manual_laya_control_schema?: ManualLayaControlSchema;
+}
+
+export interface LayaControlSchemaPreset {
+  id: string;
+  name: string;
+  description: string;
+  builtin: boolean;
+  shader_hint: string;
+  manual_laya_control_schema: ManualLayaControlSchema;
+}
+
+export interface LayaControlSchemaPresetList {
+  active_preset_id: string;
+  presets: LayaControlSchemaPreset[];
+}
+
+export interface LlmParamSemantic {
+  name: string;
+  group: string;
+  role: string;
+  transform: string;
+  gates: Array<{ kind: string; name: string; expected?: unknown; reason?: string }>;
+  dependencies: string[];
+  searchable: boolean;
+  reason: string;
+}
+
+export interface LlmInitialParamSuggestion {
+  laya_param: string;
+  suggested_value: unknown;
+  confidence: number;
+  reason: string;
+  source_unity_params: string[];
+}
+
+export interface LlmValidatedSemantics {
+  unity_feature_summary?: UnityFeatureSummary[];
+  laya_module_candidates?: LayaModuleCandidate[];
+  unity_phenomena: UnityPhenomenon[];
+  param_semantics: LlmParamSemantic[];
+  initial_laya_param_suggestions: LlmInitialParamSuggestion[];
+  warnings: string[];
+}
+
+export interface LlmSemanticsResult {
+  enabled: boolean;
+  status: 'skipped' | 'ok' | 'not_configured' | 'failed' | string;
+  reason?: string;
+  error?: string;
+  provider?: string;
+  runtime?: {
+    base_url?: string;
+    model?: string;
+    timeout_seconds?: number;
+    api_key_configured?: boolean;
+  };
+  validated?: LlmValidatedSemantics;
+  warnings?: string[];
 }
 
 export interface PreanalysisPayload {
@@ -423,11 +634,23 @@ export interface PreanalysisPayload {
   unity_shader: ShaderInfoPayload | null;
   laya_shader: ShaderInfoPayload;
   laya_material_params: Record<string, unknown>;
+  laya_material_defines?: string[];
   unity_material_params: Record<string, unknown>;
   param_mapping: ParamMappingRow[];
   stage_plan: AdjustmentPolicy[];
+  effect_graph?: Record<string, unknown>;
+  unity_feature_summary?: UnityFeatureSummary[];
+  laya_module_candidates?: LayaModuleCandidate[];
+  module_plan?: ModulePlanEntry[];
+  auto_laya_control_schema?: LayaControlSchema;
+  manual_laya_control_schema?: ManualLayaControlSchema;
+  effective_laya_control_schema?: LayaControlSchema;
+  laya_control_groups?: LayaControlGroup[];
+  llm_semantics_context?: Record<string, unknown>;
+  llm_semantics?: LlmSemanticsResult;
   coverage: PreanalysisCoverage;
   initial_recommendations: ParamRecommendation[];
+  mapping_notes?: string[];
   warnings: string[];
 }
 
@@ -436,6 +659,9 @@ export interface JobDecisionSummary {
   selected_stage: string | null;
   fit_score_before: number | null;
   diff_score_before: number | null;
+  human_accept_score?: number | null;
+  perceptual_fit_score?: number | null;
+  weighted_mae?: number | null;
   stop_reason: string | null;
   changes_count: number;
 }

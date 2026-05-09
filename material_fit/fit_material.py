@@ -7,6 +7,13 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from .auto_adjust.scoring import (
+    diff_score_to_fit_score as _diff_score_to_fit_score,
+    extract_perceptual_signals as _extract_perceptual_signals,
+    resolve_fit_score as _resolve_fit_score,
+)
+from .auto_adjust.history import load_warm_start_history as _load_warm_start_history
+from .auto_adjust.image_pairs import collect_image_pairs as _collect_image_pairs
 from .laya import lmat_io
 from .laya.refresh_probe import ProbeConfig, run_refresh_probe
 from .laya.render_driver import RenderDriver
@@ -20,6 +27,7 @@ from .optimizer.adjustment_algorithm import (
     should_abort_global,
 )
 from .optimizer.parameter_search import build_initial_params, build_stage_plan, generate_probe_candidates
+from .optimizer.semantic_graph import build_shader_effect_graph, graph_to_dict
 from .optimizer.strategy import (
     CmaesStrategyConfig,
     OptimizerUnavailableError,
@@ -36,7 +44,6 @@ from .vision.screen_capture import (
     DEFAULT_PREFIX,
     CaptureAnchor,
     capture_laya_region,
-    find_latest_candidate,
     parse_region,
 )
 
@@ -69,24 +76,25 @@ def main() -> int:
     )
     parser.add_argument(
         "--fit-score-mode",
-        choices=("linear", "perceptual"),
+        choices=("linear", "perceptual", "human_accept"),
         default=None,
         help=(
-            "How to map RGB MAE to a 0..1 fit score. 'linear' is 1 - MAE (legacy, "
-            "very lenient); 'perceptual' uses 1 - sqrt(MAE * 4) which is much more "
-            "discriminating around small MAE. Defaults to config['fit_score_mode'] "
-            "or 'linear' for backward compatibility."
+            "How to pick the 0..1 fit score. 'human_accept' uses the tolerant "
+            "material similarity score; 'perceptual' uses the stricter "
+            "channel-weighted MAE + SSIM score; 'linear' keeps legacy MAE."
         ),
     )
     parser.add_argument(
         "--optimizer",
-        choices=("heuristic", "cma_cold", "cma_warm"),
+        choices=("heuristic", "cma_cold", "cma_warm", "semantic_group"),
         default=None,
         help=(
             "Which optimizer drives parameter proposals. 'heuristic' is the "
             "stage-aware channel-bias path; 'cma_cold' is vanilla CMA-ES; "
             "'cma_warm' is Warm-Started CMA-ES seeded from prior auto_adjust "
-            "iterations. Defaults to config['optimizer'] or 'heuristic'."
+            "iterations; 'semantic_group' is a low-dimensional effect-group "
+            "search driven by the shader effect graph. Defaults to "
+            "config['optimizer'] or 'heuristic'."
         ),
     )
     parser.add_argument(
@@ -179,6 +187,10 @@ def main() -> int:
     laya_material_params = lmat_io.extract_params(laya_material)
     initial_params = build_initial_params(laya_material_params, laya_shader.params)
     adjustment_policies = build_adjustment_policies(laya_shader.params)
+    adjustment_policies = _filter_policies_by_effect_graph(
+        adjustment_policies,
+        config.get("effect_graph"),
+    )
     stages = policies_to_fit_stages(adjustment_policies) or build_stage_plan(laya_shader.params)
     unity_material_params = _load_unity_material_params(config, project_root)
 
@@ -222,10 +234,12 @@ def main() -> int:
 
     adjustment_result: dict[str, Any] | None = None
     if args.auto_adjust:
-        fit_score_mode = args.fit_score_mode or str(config.get("fit_score_mode", "linear")).lower()
-        if fit_score_mode not in ("linear", "perceptual"):
-            fit_score_mode = "linear"
+        fit_score_mode = args.fit_score_mode or str(config.get("fit_score_mode", "human_accept")).lower()
+        if fit_score_mode not in ("linear", "perceptual", "human_accept"):
+            fit_score_mode = "human_accept"
         optimizer = (args.optimizer or str(config.get("optimizer", "heuristic"))).strip().lower()
+        if optimizer not in ("heuristic", "cma_cold", "cma_warm", "semantic_group"):
+            optimizer = "heuristic"
         cma_es_config = cmaes_strategy_config_from_dict(config.get("cma_es"))
         cma_es_config = _override_cmaes_from_cli(args, cma_es_config)
         rerender_wait_ms_value = int(args.rerender_wait_ms if args.rerender_wait_ms is not None else config.get("rerender_wait_ms", 1200))
@@ -335,6 +349,42 @@ def _load_unity_material_params(config: dict[str, Any], project_root: Path) -> d
     return data if isinstance(data, dict) else {}
 
 
+def _filter_policies_by_effect_graph(
+    policies: list[Any],
+    effect_graph: Any,
+) -> list[Any]:
+    """Apply human semantic-group disables to the legacy heuristic stages too."""
+
+    if not isinstance(effect_graph, dict):
+        return policies
+    params = effect_graph.get("params")
+    if not isinstance(params, dict):
+        return policies
+    blocked = {
+        str(name)
+        for name, sem in params.items()
+        if isinstance(sem, dict) and sem.get("searchable") is False
+    }
+    if not blocked:
+        return policies
+    out: list[Any] = []
+    for policy in policies:
+        kept = [name for name in policy.params if name not in blocked]
+        if not kept:
+            continue
+        out.append(
+            type(policy)(
+                name=policy.name,
+                description=policy.description,
+                channels=policy.channels,
+                params=kept,
+                max_iterations=policy.max_iterations,
+                target_score=policy.target_score,
+            )
+        )
+    return out
+
+
 def _run_auto_adjustment(
     *,
     config: dict[str, Any],
@@ -377,6 +427,19 @@ def _run_auto_adjustment(
             auto_dir,
             limit=(cma_es_config.warm_start_iters if cma_es_config else 12),
         )
+    semantic_graph = config.get("effect_graph") if isinstance(config.get("effect_graph"), dict) else None
+    if semantic_graph is None:
+        try:
+            material_defines = lmat_io.extract_defines(lmat_io.load_lmat(laya_material_path))
+        except Exception:  # noqa: BLE001
+            material_defines = []
+        semantic_graph = graph_to_dict(
+            build_shader_effect_graph(
+                laya_shader_params,
+                material_params=initial_params,
+                material_defines=material_defines,
+            )
+        )
 
     try:
         strategy = build_strategy(
@@ -387,6 +450,8 @@ def _run_auto_adjustment(
             unity_material_params=unity_material_params,
             cma_es_config=cma_es_config,
             warm_start_history=warm_history,
+            semantic_graph=semantic_graph,
+            auto_adjust_mode=str(config.get("auto_adjust_mode", "fresh_fit")),
         )
     except (OptimizerUnavailableError, ValueError) as exc:
         payload = {
@@ -425,12 +490,9 @@ def _run_auto_adjustment(
             )
         )
         diff_score = float(analysis.get("score", math.inf)) if isinstance(analysis.get("score"), (int, float)) else math.inf
-        # E-009: prefer the new perceptual_fit_score (auto-mask +
-        # channel-weighted MAE + SSIM) when available; fall back to
-        # the legacy 1 - sqrt(MAE * 4) mapping otherwise. The legacy
-        # ``diff_score`` (raw global RGB MAE) is still surfaced so
-        # the optimizer's coordinate-descent fallback and any
-        # historical tooling continue to work unchanged.
+        # Prefer the configured headline score for optimization while
+        # keeping all stricter pixel/perceptual signals in the iteration
+        # payload for diagnosis.
         fit_score = _resolve_fit_score(analysis, diff_score, mode=fit_score_mode)
         if fit_score > best_fit_score:
             best_fit_score = fit_score
@@ -496,6 +558,26 @@ def _run_auto_adjustment(
             payload = {"status": "pending", "reason": "No adjustable shader parameters available.", "target_score": target_score, "best_fit_score": best_fit_score, "iterations": result_iterations}
             _write_json(auto_dir / "auto_adjust_result.json", payload)
             return payload
+        # Phase-summary 2026-05-08 follow-up: if SemanticGroupStrategy
+        # has marked every group exhausted there is *nothing* worth
+        # writing — re-applying the unchanged base params would just
+        # waste a full Laya re-render + screenshot cycle and produce a
+        # phantom iteration with stage=None that historically crashed
+        # the iteration_payload builder. Bail out here with the
+        # current best params intact and let the outer "completed"
+        # block summarise normally.
+        early_stop_reasons = {
+            "all_semantic_groups_exhausted",
+            "no_semantic_groups",
+            "semantic_groups_exhausted",
+        }
+        if decision.get("stop_reason") in early_stop_reasons:
+            print(
+                f"[strategy] {decision.get('stop_reason')} at iter {iteration} — "
+                f"breaking out of auto_adjust loop early.",
+                flush=True,
+            )
+            break
         if diff_score < state.best_score - 1e-6:
             state.global_no_improve = 0
         else:
@@ -542,7 +624,32 @@ def _run_auto_adjustment(
             if not apply_lmat:
                 decision["screen_capture_after_apply_skipped"] = "requires --apply-lmat because this mode verifies the real .lmat write path"
             else:
-                if rerender_wait_ms > 0:
+                screen_capture_cfg = config.get("screen_capture", {}) if isinstance(config.get("screen_capture"), dict) else {}
+                capture_dir = _resolve_path(project_root, screen_capture_cfg.get("capture_dir", str(DEFAULT_CAPTURE_DIR)))
+                state_file_value = screen_capture_cfg.get("state_file")
+                state_file = _resolve_path(project_root, state_file_value) if state_file_value else capture_dir / ".capture_region.json"
+                region_text = screen_capture_region or str(screen_capture_cfg.get("region", ""))
+                explicit_region = parse_region(region_text) if region_text else None
+                wait_cfg = config.get("dynamic_rerender_wait", {}) if isinstance(config.get("dynamic_rerender_wait"), dict) else {}
+                dynamic_wait_enabled = bool(wait_cfg.get("enabled", True))
+                if dynamic_wait_enabled and rerender_wait_ms > 0:
+                    wait_payload = _wait_for_visual_refresh(
+                        previous_candidate_path=pair.get("candidate"),
+                        max_wait_ms=rerender_wait_ms,
+                        interval_ms=int(wait_cfg.get("interval_ms", 200)),
+                        min_wait_ms=int(wait_cfg.get("min_wait_ms", 250)),
+                        diff_threshold=float(wait_cfg.get("diff_threshold", 0.25)),
+                        capture_dir=capture_dir,
+                        region=explicit_region,
+                        reuse_last=explicit_region is None,
+                        state_file=state_file,
+                        anchor=_build_capture_anchor(config),
+                        focus_callback=focus_callback,
+                    )
+                    decision["dynamic_rerender_wait"] = wait_payload
+                    if not wait_payload.get("changed"):
+                        time.sleep(max(rerender_wait_ms - int(wait_payload.get("elapsed_ms", 0)), 0) / 1000.0)
+                elif rerender_wait_ms > 0:
                     time.sleep(rerender_wait_ms / 1000.0)
                 # Focus Laya again right before the screenshot. The
                 # rerender_wait_ms sleep above can give other windows
@@ -551,12 +658,6 @@ def _run_auto_adjustment(
                 # screen when GDI grabs the pixels.
                 if focus_callback is not None:
                     focus_log.append(focus_callback(f"iter_{iteration:04d}_before_capture"))
-                screen_capture_cfg = config.get("screen_capture", {}) if isinstance(config.get("screen_capture"), dict) else {}
-                capture_dir = _resolve_path(project_root, screen_capture_cfg.get("capture_dir", str(DEFAULT_CAPTURE_DIR)))
-                state_file_value = screen_capture_cfg.get("state_file")
-                state_file = _resolve_path(project_root, state_file_value) if state_file_value else capture_dir / ".capture_region.json"
-                region_text = screen_capture_region or str(screen_capture_cfg.get("region", ""))
-                explicit_region = parse_region(region_text) if region_text else None
                 # E-012: cap the rolling ``prefix_NN.png`` pool. CLI
                 # override > config > default 30. Set <= 0 to disable
                 # pruning entirely (matches legacy behavior).
@@ -583,33 +684,49 @@ def _run_auto_adjustment(
                 candidate_override = str(screen_capture_result["output_path"])
         if focus_log:
             decision["focus_log"] = focus_log
+        # P0 phase-summary 2026-05-08 follow-up: SemanticGroupStrategy
+        # legitimately returns ``decision = {"stage": None,
+        # "stop_reason": "all_semantic_groups_exhausted"}`` when every
+        # group has either probed-out or run out of axes. The previous
+        # ``decision.get("stage", {}).get("name")`` call assumed the
+        # ``stage`` slot was always at least an empty dict; with the new
+        # strategies that's no longer true and the run died at iter_30
+        # with ``AttributeError: 'NoneType' object has no attribute
+        # 'get'``. Treat any falsy stage payload as "no stage selected"
+        # rather than crashing — and let the strategy_stop_reason path
+        # below break out of the loop cleanly.
+        decision_stage = decision.get("stage")
+        if isinstance(decision_stage, dict):
+            selected_stage_name = decision_stage.get("name")
+        else:
+            selected_stage_name = None
         iteration_payload = {
             "iteration": iteration,
             "input_pair": pair,
             "diff_score_before": diff_score,
             "fit_score_before": fit_score,
             "target_score": target_score,
-            "selected_stage": decision.get("stage", {}).get("name"),
+            "selected_stage": selected_stage_name,
             "decision": decision,
             "params_path": str(params_path),
             "candidate_lmat_path": candidate_lmat_path,
             "render_result": render_result,
             "screen_capture_after_apply": screen_capture_result,
-            # E-009 audit: keep the raw perceptual signals next to
-            # the headline fit_score so post-mortem analyses can
-            # tell whether a regression came from MAE drift, SSIM
-            # drift, or auto-mask coverage drift.
+            # Keep both strict and tolerant signals next to the headline
+            # fit_score so post-mortems can tell whether a regression came
+            # from MAE drift, SSIM drift, auto-mask coverage, or human-score
+            # component drift.
             "perceptual_signals": _extract_perceptual_signals(analysis),
         }
+        strategy_stop = strategy.stop_reason()
+        if strategy_stop:
+            iteration_payload["decision"]["strategy_stop_reason"] = strategy_stop
         _write_json(iteration_dir / "decision.json", iteration_payload)
         result_iterations.append(iteration_payload)
         state.history.append(iteration_payload)
         current_params = next_params
         state.iteration += 1
-
-        strategy_stop = strategy.stop_reason()
         if strategy_stop:
-            iteration_payload["decision"]["strategy_stop_reason"] = strategy_stop
             break
 
     save_adjustment_state(auto_dir / "state.json", state)
@@ -629,6 +746,7 @@ def _run_auto_adjustment(
             else None
         ),
         "warm_start_history_size": len(warm_history) if optimizer == "cma_warm" else 0,
+        "effect_graph": semantic_graph,
     }
     _write_json(auto_dir / "auto_adjust_result.json", payload)
     return payload
@@ -666,6 +784,15 @@ def _run_laya_refresh_preflight(
     preflight_capture_dir.mkdir(parents=True, exist_ok=True)
 
     anchor = _build_capture_anchor(config)
+    probe_cfg = config.get("laya_refresh_probe") if isinstance(config.get("laya_refresh_probe"), dict) else {}
+    change_threshold = _coerce_probe_threshold(
+        probe_cfg.get("mean_diff_change_threshold"),
+        0.5,
+    )
+    restore_threshold = _coerce_probe_threshold(
+        probe_cfg.get("mean_diff_restore_threshold"),
+        2.5,
+    )
 
     def _capture(step: str) -> Path:
         # Probe writes exactly three fixed-name files. Skip the
@@ -689,7 +816,12 @@ def _run_laya_refresh_preflight(
         laya_material_path=laya_material_path,
         laya_shader_params=laya_shader_params,
         capture=_capture,
-        config=ProbeConfig(probe_param=probe_param, rerender_wait_ms=rerender_wait_ms),
+        config=ProbeConfig(
+            probe_param=probe_param,
+            rerender_wait_ms=rerender_wait_ms,
+            mean_diff_change_threshold=change_threshold,
+            mean_diff_restore_threshold=restore_threshold,
+        ),
         output_dir=preflight_capture_dir,
         focus=focus_callback,
     )
@@ -717,6 +849,16 @@ def _build_capture_anchor(config: dict[str, Any]) -> CaptureAnchor | None:
         process_pattern=str(raw.get("process_pattern", "LayaAirIDE")),
         title_pattern=str(raw.get("title_pattern", "")),
     )
+
+
+def _coerce_probe_threshold(value: Any, default: float) -> float:
+    if value is None or value == "":
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0.0 else default
 
 
 def _build_focus_callback(
@@ -785,191 +927,110 @@ def _override_cmaes_from_cli(args: argparse.Namespace, base: CmaesStrategyConfig
     )
 
 
-def _load_warm_start_history(
-    auto_dir: Path,
+def _wait_for_visual_refresh(
     *,
-    limit: int,
-) -> list[tuple[dict[str, Any], float]]:
-    """Scan ``auto_adjust/iter_*/`` for completed (params, fit_score) pairs.
+    previous_candidate_path: str | None,
+    max_wait_ms: int,
+    interval_ms: int,
+    min_wait_ms: int,
+    diff_threshold: float,
+    capture_dir: Path,
+    region: Any,
+    reuse_last: bool,
+    state_file: Path,
+    anchor: CaptureAnchor | None,
+    focus_callback: Callable[[str], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Poll the Laya viewport until it visibly changes or timeout.
 
-    Used to feed prior heuristic iterations into Warm-Started CMA-ES.
-    Iterations whose ``params.json`` is missing or whose
-    ``fit_score_before`` is non-finite are skipped.
-    Sorted by iteration index ascending so WS-MGD sees a consistent
-    chronological prior.
-    """
-    if limit <= 0 or not auto_dir.is_dir():
-        return []
-    out: list[tuple[int, dict[str, Any], float]] = []
-    for entry in auto_dir.iterdir():
-        if not entry.is_dir() or not entry.name.startswith("iter_"):
-            continue
-        try:
-            idx = int(entry.name[len("iter_"):])
-        except ValueError:
-            continue
-        params_path = entry / "candidate" / "params.json"
-        decision_path = entry / "decision.json"
-        if not params_path.exists() or not decision_path.exists():
-            continue
-        try:
-            params = json.loads(params_path.read_text(encoding="utf-8-sig"))
-            decision = json.loads(decision_path.read_text(encoding="utf-8-sig"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(params, dict) or not isinstance(decision, dict):
-            continue
-        fit_score = decision.get("fit_score_before")
-        if not isinstance(fit_score, (int, float)) or not math.isfinite(float(fit_score)):
-            continue
-        out.append((idx, params, float(fit_score)))
-    out.sort(key=lambda item: item[0])
-    return [(params, fit_score) for _, params, fit_score in out[-limit:]]
-
-
-def _diff_score_to_fit_score(diff_score: float, *, mode: str = "linear") -> float:
-    """Convert lower-is-better RGB MAE into a higher-is-better automation score.
-
-    ``linear``     — legacy ``1 - MAE``. Lenient; an MAE of 0.21 (very visibly
-                     wrong) maps to 0.79 which makes ``target_score=0.5`` trivially
-                     trip-able. Kept for backward compatibility.
-    ``perceptual`` — ``1 - sqrt(MAE * 4)`` clamped. MAE 0.01 → 0.80, MAE 0.05 → 0.55,
-                     MAE 0.10 → 0.37, MAE 0.21 → 0.08. Much more discriminating
-                     around small MAE; matches the human-perception expectation
-                     that "barely visible difference" should already be ~0.8 and
-                     "obviously different" should be near zero.
-
-    Note: experiment **E-009** introduced a more correct
-    ``perceptual_v2`` route via :func:`_resolve_fit_score` which
-    consumes the auto-mask + channel-weighted + SSIM signals from
-    :mod:`vision.diff_analysis`. This function is kept as the fall
-    back path for the rare case the analysis dict does not carry
-    those fields (e.g. unit tests that synthesize a minimal
-    analysis).
+    This is a conservative speed-up over the old fixed sleep. It does
+    **not** assume the first changed frame is perfect; it simply avoids
+    burning the full 1.5s when the viewport has already refreshed. If
+    no change is detected, the caller sleeps out the remaining budget
+    and uses the normal final capture path.
     """
 
-    if not math.isfinite(diff_score):
-        return -math.inf
-    mae = max(0.0, float(diff_score))
-    if mode == "perceptual":
-        return max(0.0, min(1.0, 1.0 - math.sqrt(mae * 4.0)))
-    return max(0.0, min(1.0, 1.0 - mae))
-
-
-def _extract_perceptual_signals(analysis: dict[str, Any]) -> dict[str, Any]:
-    """Pull the E-009 perceptual block out of an analysis dict.
-
-    Returns ``{}`` when the analysis was produced by an older
-    pipeline that doesn't carry the new fields. The result is meant
-    to be embedded in ``decision.json`` next to ``diff_score_before``
-    / ``fit_score_before`` so future runs can do "what changed"
-    forensics over time.
-    """
-
-    if not isinstance(analysis, dict):
-        return {}
-    perc = analysis.get("perceptual")
-    auto_mask = analysis.get("auto_mask")
-    if not isinstance(perc, dict):
-        return {}
-    out: dict[str, Any] = {
-        "weighted_mae": perc.get("weighted_mae"),
-        "ssim": perc.get("ssim"),
-        "ssim_status": perc.get("ssim_status"),
-        "fit_score": perc.get("fit_score"),
-        "fit_components": perc.get("fit_components"),
-        "branch_weights": perc.get("branch_weights"),
-        "weights_used": perc.get("weights_used"),
-        "coverage": perc.get("coverage"),
+    started = time.perf_counter()
+    max_wait = max(0, int(max_wait_ms)) / 1000.0
+    interval = max(50, int(interval_ms)) / 1000.0
+    min_wait = max(0, int(min_wait_ms)) / 1000.0
+    payload: dict[str, Any] = {
+        "enabled": True,
+        "changed": False,
+        "elapsed_ms": 0,
+        "samples": [],
+        "reason": "",
     }
-    if isinstance(auto_mask, dict):
-        out["auto_mask"] = {
-            "status": auto_mask.get("status"),
-            "foreground_ratio": auto_mask.get("foreground_ratio"),
-            "reference_bg_ratio": auto_mask.get("reference_bg_ratio"),
-            "candidate_bg_ratio": auto_mask.get("candidate_bg_ratio"),
-            "reference_bg_color": auto_mask.get("reference_bg_color"),
-            "candidate_bg_color": auto_mask.get("candidate_bg_color"),
-        }
-    return out
+    previous = Path(previous_candidate_path) if previous_candidate_path else None
+    if previous is None or not previous.exists():
+        time.sleep(max_wait)
+        payload.update({"elapsed_ms": int(max_wait * 1000), "reason": "missing previous candidate; fixed wait used"})
+        return payload
+
+    probe_path = capture_dir / "_dynamic_wait_probe.png"
+    sample_idx = 0
+    while True:
+        elapsed = time.perf_counter() - started
+        if elapsed < min_wait:
+            time.sleep(min(interval, min_wait - elapsed))
+            continue
+        if elapsed >= max_wait:
+            payload["reason"] = "timeout_without_visible_change"
+            break
+        if focus_callback is not None:
+            focus_callback(f"dynamic_wait_probe_{sample_idx:02d}")
+        result = capture_laya_region(
+            region=region,
+            reuse_last=reuse_last,
+            capture_dir=capture_dir,
+            state_file=state_file,
+            prefix=DEFAULT_PREFIX,
+            dry_run=False,
+            anchor=anchor,
+            output_path=probe_path,
+        )
+        diff = _mean_image_diff(previous, Path(result["output_path"]))
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        payload["samples"].append({"elapsed_ms": elapsed_ms, "diff": diff})
+        if diff >= diff_threshold:
+            payload.update(
+                {
+                    "changed": True,
+                    "elapsed_ms": elapsed_ms,
+                    "reason": "visible_change_detected",
+                    "diff_threshold": diff_threshold,
+                }
+            )
+            return payload
+        sample_idx += 1
+        time.sleep(interval)
+    payload["elapsed_ms"] = int((time.perf_counter() - started) * 1000)
+    payload["diff_threshold"] = diff_threshold
+    return payload
 
 
-def _resolve_fit_score(
-    analysis: dict[str, Any],
-    diff_score: float,
-    *,
-    mode: str = "linear",
-) -> float:
-    """Pick the right ``fit_score`` route for one analysis result.
-
-    Priority (E-009 contract):
-
-    1. If ``analysis['perceptual_fit_score']`` is present and finite,
-       use it directly. This is the auto-mask + channel-weighted MAE
-       + SSIM combined score.
-    2. Otherwise fall back to :func:`_diff_score_to_fit_score` with
-       ``mode``. This keeps the older ``perceptual`` /``linear`` modes
-       working for any caller that still produces a barebones
-       analysis dict.
-
-    The two paths return values in [0, 1] (clamped). The new path
-    is generally lower-valued than the legacy one for the same scene
-    (because it removes the background "free pixels"), which is a
-    feature, not a bug — the optimizer now has real headroom.
-    """
-
-    raw = analysis.get("perceptual_fit_score") if isinstance(analysis, dict) else None
-    if isinstance(raw, (int, float)) and math.isfinite(float(raw)):
-        return max(0.0, min(1.0, float(raw)))
-    return _diff_score_to_fit_score(diff_score, mode=mode)
-
-
-def _collect_image_pairs(config: dict[str, Any], project_root: Path, output_dir: Path, *, candidate_override: str | None = None) -> list[dict[str, str]]:
-    pairs = config.get("image_pairs")
-    if pairs:
-        collected_pairs: list[dict[str, str]] = []
-        for pair in pairs:
-            collected: dict[str, str] = {}
-            for key, value in pair.items():
-                if key not in {"reference", "candidate", "mask"} or not value:
-                    continue
-                if key == "candidate" and candidate_override:
-                    collected[key] = candidate_override
-                    continue
-                if key == "candidate" and str(value).lower() == "latest":
-                    latest = find_latest_candidate(pair.get("candidate_dir", DEFAULT_CAPTURE_DIR), pair.get("candidate_prefix", DEFAULT_PREFIX))
-                    if latest:
-                        collected[key] = str(latest)
-                    continue
-                collected[key] = str(_resolve_path(project_root, value))
-            if "reference" in collected and "candidate" in collected:
-                collected_pairs.append(collected)
-        return collected_pairs
-
-    references = config.get("reference_images", [])
-    candidates = config.get("candidate_images", [])
-    masks = config.get("mask_images", [])
-    collected: list[dict[str, str]] = []
-    for index, reference in enumerate(references):
-        if index < len(candidates):
-            candidate = candidates[index]
-            pair = {
-                "reference": str(_resolve_path(project_root, reference)),
-                "candidate": str(candidate_override or (
-                    find_latest_candidate(DEFAULT_CAPTURE_DIR, DEFAULT_PREFIX)
-                    if str(candidate).lower() == "latest" and find_latest_candidate(DEFAULT_CAPTURE_DIR, DEFAULT_PREFIX)
-                    else _resolve_path(project_root, candidate)
-                )),
-            }
-            if index < len(masks) and masks[index]:
-                pair["mask"] = str(_resolve_path(project_root, masks[index]))
-            collected.append(pair)
-    if not collected:
-        auto_reference = output_dir / "unity_reference.png"
-        auto_candidate = output_dir / "laya_capture.png"
-        if auto_reference.exists() and auto_candidate.exists():
-            collected.append({"reference": str(auto_reference), "candidate": str(auto_candidate)})
-    return collected
+def _mean_image_diff(a_path: Path, b_path: Path) -> float:
+    try:
+        from PIL import Image
+    except ImportError:
+        return 0.0
+    try:
+        with Image.open(a_path).convert("RGB") as a_img, Image.open(b_path).convert("RGB") as b_img:
+            if a_img.size != b_img.size:
+                b_img = b_img.resize(a_img.size)
+            # Downsample aggressively; we only need a refresh detector,
+            # not a material score. Return mean channel difference in
+            # 0..255 units so thresholds are easy to reason about.
+            a_small = a_img.resize((64, 64))
+            b_small = b_img.resize((64, 64))
+            a_px = list(a_small.getdata())
+            b_px = list(b_small.getdata())
+            total = 0.0
+            for a, b in zip(a_px, b_px):
+                total += abs(a[0] - b[0]) + abs(a[1] - b[1]) + abs(a[2] - b[2])
+            return total / max(1, len(a_px) * 3)
+    except Exception:
+        return 0.0
 
 
 if __name__ == "__main__":

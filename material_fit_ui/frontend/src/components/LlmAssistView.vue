@@ -40,7 +40,7 @@ async function save(): Promise<void> {
   <div class="llm-view">
     <header style="display: flex; gap: 12px; align-items: baseline;">
       <h2 class="section-title" style="margin: 0;">LLM 助手</h2>
-      <span class="muted small">骨架占位 · 未来接入 GPT-4 / Claude / Gemini</span>
+      <span class="muted small">OpenAI-compatible · 预分析阶段读取 shader 生成语义先验</span>
     </header>
 
     <div v-if="error" class="error-banner">{{ error }}</div>
@@ -50,14 +50,11 @@ async function save(): Promise<void> {
       <ul class="plan-list">
         <li>
           <strong>预分析阶段</strong>：把 Unity/Laya shader 源 + 解析后 uniformMap 喂给 LLM，
-          要求生成跨引擎参数映射、识别 Unity 端独有特性的迁移方案、并在
-          <span class="mono">predicted_strategy</span> 字段返回结构化建议。
+          要求生成 Unity 参考现象、Laya 效果组、gate/define、参数角色和初版参数参考。
         </li>
         <li>
-          <strong>每轮调参</strong>：把当前迭代的 <span class="mono">decision.json</span> +
-          <span class="mono">diff_analysis.json</span> + 最近 3 轮历史送进 LLM，请它在算法
-          抽不出方向时（如所有阶段都被标记 <span class="mono">no_effective_change</span>）
-          补一个语义化建议（"压暗 base color、提高 fresnel power"等）。
+          <strong>闭环调参</strong>：暂时不让 LLM 进入每轮优化循环。模型输出只作为语义先验，
+          后续由探针、pattern search 和 CMA-ES 用真实截图评分。
         </li>
         <li>
           <strong>停滞救援</strong>：当 fit_score 连续 N 轮无明显改进，算法层主动调用 LLM 提议
@@ -72,24 +69,22 @@ async function save(): Promise<void> {
     </section>
 
     <section class="section" v-if="project">
-      <h3 class="section-title">本项目的 LLM 设置（暂存，不调真 LLM）</h3>
+      <h3 class="section-title">本项目的 LLM 设置</h3>
       <p class="muted small">
-        现在保存的是项目的 LLM 偏好；后端尚未接入实际 provider。等我们把硬缺口（真实 Laya 闭环 +
-        真正的搜索算法）填好后，会在这里加 API key 字段并对接到 `optimizer/` 里。
+        后端从仓库根目录的 <span class="mono">.env</span> 读取
+        <span class="mono">OPENAI_BASE_URL</span>、<span class="mono">OPENAI_API_KEY</span>、
+        <span class="mono">OPENAI_MODEL</span>。API key 不会存入项目配置。
       </p>
       <div class="llm-form">
         <label>
           <input type="checkbox" v-model="enabled" />
-          启用 LLM 辅助（当前不会发起真实请求）
+          启用 LLM 语义预分析
         </label>
         <label>
           provider
           <select v-model="provider">
             <option value="">未选择</option>
-            <option value="openai">OpenAI (GPT-4o/4.1)</option>
-            <option value="anthropic">Anthropic (Claude 4)</option>
-            <option value="gemini">Google Gemini 2</option>
-            <option value="local">本地模型（Ollama 等）</option>
+            <option value="openai-compatible">OpenAI-compatible</option>
           </select>
         </label>
         <button class="primary" @click="save">保存设置</button>
@@ -115,16 +110,16 @@ async function save(): Promise<void> {
           <span class="mono">scikit-optimize</span> 之类的实现。
         </li>
         <li>
-          <span class="kbd">优先级 P1</span> Unity → Laya 参数映射字典：现在用名字相似度，
-          准确率约 60%。要落实一份 Unity Standard / URP Lit / Toon → Laya 标准着色器的语义对照表。
+          <span class="kbd">优先级 P1</span> 语义输出校验：LLM 负责理解 shader，确定性代码负责拒绝未知参数、
+          未知 define 和非法 gate。
         </li>
         <li>
           <span class="kbd">优先级 P1</span> 区域语义分析：图像 diff 现在是全图 RGB MAE。
           要根据材质语义（高光/阴影/边缘）按 mask 加权评分，避免高频噪声拉低分数。
         </li>
         <li>
-          <span class="kbd">优先级 P2</span> LLM 实接入：上面任意一个挂上去之前，
-          <span class="mono">llm_config.enabled</span> 都只是声明意图。
+          <span class="kbd">优先级 P2</span> 结果缓存和对照评估：缓存每次 LLM 语义结果，并比较
+          LLM 主路径与命名 fallback 在真实 shader 上的差异。
         </li>
       </ul>
     </section>

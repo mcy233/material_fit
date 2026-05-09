@@ -147,7 +147,7 @@ def create_project(
             "laya_window": {
                 "process_pattern": "LayaAirIDE",
                 "title_pattern": "",
-                "settle_ms": 250,
+                "settle_ms": 100,
             },
             # E-008 follow-up: anchor the capture region to the Laya
             # window's top-left corner so dragging/resizing the editor
@@ -171,21 +171,33 @@ def create_project(
             "target_score": 0.5,
             "apply_lmat": True,
             "capture_screen_after_apply": True,
-            "rerender_wait_ms": 1500,
+            "rerender_wait_ms": 900,
+            "dynamic_rerender_wait": {
+                "enabled": True,
+                "min_wait_ms": 250,
+                "interval_ms": 200,
+                "diff_threshold": 0.25,
+            },
             "use_capture_contract": False,
             "dry_run": False,
-            "fit_score_mode": "perceptual",
+            "fit_score_mode": "human_accept",
+            # fresh_fit starts from a controlled baseline before searching;
+            # refine_current keeps the current .lmat as-is and only continues
+            # local optimization.
+            "auto_adjust_mode": "fresh_fit",
             # E-007: run the magenta-probe refresh check before each
             # auto-adjust run, to guarantee Laya is actually re-rendering
             # after .lmat writes. Saves debugging hours when Laya is in
             # background or some other window stole focus.
             "laya_refresh_check": True,
-            # E-006 (ExperimentLog.md): optimizer is now pluggable.
-            # 'heuristic' is the default safe path. Switch to 'cma_warm'
-            # once you have ≥2 prior heuristic iterations to seed the
-            # warm-start MGD; 'cma_cold' for vanilla CMA-ES with no
-            # prior. UI surface is in AlgoConfigView.vue.
-            "optimizer": "heuristic",
+            "laya_refresh_probe": {
+                "mean_diff_change_threshold": 0.5,
+                "mean_diff_restore_threshold": 2.5,
+            },
+            # E-006/E-014: optimizer is pluggable. 'semantic_group'
+            # is the shader-semantics-driven low-dimensional path;
+            # cma_* remain available for ablations.
+            "optimizer": "semantic_group",
             "cma_es": {
                 "mode": "warm",
                 "warm_start_iters": 12,
@@ -197,12 +209,28 @@ def create_project(
                 # default, > 0.5 is heavy expert-driven exploration.
                 "hint_bias_mix_ratio": 0.30,
             },
+            # Human-in-the-loop search-space control. Keys are Laya
+            # semantic group names from preanalysis.laya_control_groups;
+            # values are {"enabled": bool}. Disabled groups are removed
+            # from semantic_group / CMA active search spaces when
+            # fit_config.json is generated.
+            "laya_control_group_overrides": {},
         },
         "manual_param_mapping": {},
+        "manual_laya_control_schema": {
+            "schema_version": 1,
+            "base_auto_hash": "",
+            "groups": {},
+            "controls": {},
+            "deleted_groups": [],
+            "hidden_controls": [],
+        },
+        "active_laya_control_schema_preset_id": "auto",
+        "laya_control_schema_presets": [],
         "llm_config": {
             "enabled": False,
-            "provider": None,
-            "note": "Future: LLM will analyze each iteration's diff and propose param adjustments.",
+            "provider": "openai-compatible",
+            "note": "LLM is used for preanalysis shader semantics only; API settings are read from .env.",
         },
         "preanalysis_path": None,
         "active_job_id": None,
@@ -296,7 +324,7 @@ def derive_fit_config(project_id: str, config: LoaderConfig | None = None) -> di
         )
 
     optimizer_value = str(algo.get("optimizer", "heuristic")).strip().lower()
-    if optimizer_value not in ("heuristic", "cma_cold", "cma_warm"):
+    if optimizer_value not in ("heuristic", "cma_cold", "cma_warm", "semantic_group"):
         optimizer_value = "heuristic"
     raw_cma_es = algo.get("cma_es") if isinstance(algo.get("cma_es"), dict) else {}
     raw_mix = raw_cma_es.get("hint_bias_mix_ratio", 0.30)
@@ -318,6 +346,7 @@ def derive_fit_config(project_id: str, config: LoaderConfig | None = None) -> di
         # picks up the mix ratio even if no CLI override is set.
         "hint_bias_mix_ratio": mix_ratio_value,
     }
+    preanalysis = _read_json(paths.preanalysis_json) if paths.preanalysis_json.exists() else None
 
     fit_config: dict[str, Any] = {
         "case_name": project.get("id"),
@@ -328,7 +357,16 @@ def derive_fit_config(project_id: str, config: LoaderConfig | None = None) -> di
         "image_pairs": image_pairs,
         "auto_adjust_target_score": float(algo.get("target_score", 0.5)),
         "capture_screen_after_apply": bool(algo.get("capture_screen_after_apply", False)),
-        "rerender_wait_ms": int(algo.get("rerender_wait_ms", 1200)),
+        "rerender_wait_ms": int(algo.get("rerender_wait_ms", 900)),
+        "dynamic_rerender_wait": algo.get(
+            "dynamic_rerender_wait",
+            {
+                "enabled": True,
+                "min_wait_ms": 250,
+                "interval_ms": 200,
+                "diff_threshold": 0.25,
+            },
+        ),
         "screen_capture": {
             "capture_dir": _abs(inputs.get("laya_capture_dir"))
             or str((config.image_root / "vision" / "test_image").resolve()),
@@ -347,15 +385,31 @@ def derive_fit_config(project_id: str, config: LoaderConfig | None = None) -> di
         "dry_run": bool(algo.get("dry_run", False)),
         "render_command": [],
         "laya_capture": {},
-        "fit_score_mode": str(algo.get("fit_score_mode", "linear")).lower(),
+        "fit_score_mode": str(algo.get("fit_score_mode", "human_accept")).lower(),
+        "auto_adjust_mode": str(algo.get("auto_adjust_mode", "fresh_fit")).lower(),
         "optimizer": optimizer_value,
         "cma_es": cma_es_payload,
+        "laya_refresh_probe": _normalize_laya_refresh_probe(algo.get("laya_refresh_probe")),
         "laya_window": _normalize_laya_window(inputs.get("laya_window")),
         "laya_capture_anchor": _normalize_capture_anchor(
             inputs.get("laya_capture_anchor"),
             inputs.get("laya_window"),
         ),
     }
+    if isinstance(preanalysis, dict):
+        if isinstance(preanalysis.get("effect_graph"), dict):
+            fit_config["effect_graph"] = _apply_effective_laya_control_schema(
+                preanalysis["effect_graph"],
+                preanalysis.get("effective_laya_control_schema"),
+                algo.get("laya_control_group_overrides"),
+            )
+        if isinstance(preanalysis.get("module_plan"), list):
+            fit_config["module_plan"] = _apply_module_plan_overrides(
+                preanalysis["module_plan"],
+                algo.get("laya_control_group_overrides"),
+            )
+        if isinstance(preanalysis.get("effective_laya_control_schema"), dict):
+            fit_config["effective_laya_control_schema"] = preanalysis["effective_laya_control_schema"]
     return fit_config
 
 
@@ -472,6 +526,151 @@ def _normalize_laya_window(value: Any) -> dict[str, Any]:
         "title_pattern": str(value.get("title_pattern", "")),
         "settle_ms": int(value.get("settle_ms", 250) or 0),
     }
+
+
+def _normalize_laya_refresh_probe(value: Any) -> dict[str, float]:
+    if not isinstance(value, dict):
+        value = {}
+    change = _coerce_optional_float(value.get("mean_diff_change_threshold"))
+    restore = _coerce_optional_float(value.get("mean_diff_restore_threshold"))
+    return {
+        "mean_diff_change_threshold": change if change is not None and change >= 0.0 else 0.5,
+        "mean_diff_restore_threshold": restore if restore is not None and restore >= 0.0 else 2.5,
+    }
+
+
+def _apply_effective_laya_control_schema(
+    effect_graph: dict[str, Any],
+    effective_schema: Any,
+    overrides: Any,
+) -> dict[str, Any]:
+    payload = json.loads(json.dumps(effect_graph))
+    groups = payload.get("groups") if isinstance(payload.get("groups"), dict) else {}
+    params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+    if isinstance(effective_schema, dict):
+        schema_groups = effective_schema.get("groups") if isinstance(effective_schema.get("groups"), list) else []
+        for raw_group in schema_groups:
+            if not isinstance(raw_group, dict) or not raw_group.get("id"):
+                continue
+            group_name = str(raw_group["id"])
+            graph_group = groups.setdefault(
+                group_name,
+                {
+                    "name": group_name,
+                    "params": [],
+                    "gate_params": [],
+                    "define_gates": [],
+                    "channels": [],
+                    "active": True,
+                    "current_active": True,
+                    "suggested_by_unity": False,
+                    "probe_required": False,
+                    "search_priority": 0.0,
+                    "search_params": [],
+                    "unity_features": [],
+                    "evidence": [],
+                    "reason": "",
+                },
+            )
+            graph_group["name"] = group_name
+            graph_group["current_active"] = bool(raw_group.get("current_active", True))
+            graph_group["active"] = bool(raw_group.get("current_active", True))
+            graph_group["suggested_by_unity"] = bool(raw_group.get("suggested_by_unity", False))
+            graph_group["probe_required"] = bool(raw_group.get("probe_required", False))
+            graph_group["search_priority"] = float(raw_group.get("search_priority", 0.0) or 0.0)
+            graph_group["order"] = int(raw_group.get("order", 0) or 0)
+            graph_group["define_gates"] = [str(item) for item in raw_group.get("define_gates", []) if isinstance(item, str)]
+            graph_group["gate_params"] = [str(item) for item in raw_group.get("gate_params", []) if isinstance(item, str)]
+            controls = [item for item in raw_group.get("controls", []) if isinstance(item, dict) and item.get("name")]
+            control_names = [str(item["name"]) for item in controls]
+            graph_group["params"] = control_names
+            graph_group["search_params"] = [
+                str(item["name"])
+                for item in controls
+                if item.get("searchable") is True and bool(raw_group.get("enabled", True))
+            ]
+            if not bool(raw_group.get("enabled", True)):
+                graph_group["manual_enabled"] = False
+                graph_group["suggested_by_unity"] = False
+                graph_group["probe_required"] = False
+                graph_group["search_priority"] = 0.0
+                graph_group["search_params"] = []
+            for control in controls:
+                name = str(control["name"])
+                param = params.get(name)
+                if not isinstance(param, dict):
+                    continue
+                param["group"] = group_name
+                param["role"] = str(control.get("role") or param.get("role") or "value")
+                param["transform"] = str(control.get("transform") or param.get("transform") or "linear")
+                param["searchable"] = bool(control.get("searchable", True) and raw_group.get("enabled", True))
+                range_min = control.get("range_min")
+                range_max = control.get("range_max")
+                if isinstance(range_min, (int, float)) and isinstance(range_max, (int, float)) and float(range_min) < float(range_max):
+                    param["range_min"] = float(range_min)
+                    param["range_max"] = float(range_max)
+                    param["range_source"] = "effective_visual_search"
+                if control.get("reason"):
+                    param["reason"] = str(control.get("reason"))
+
+    disabled = _disabled_laya_control_groups(overrides)
+    for group_name in disabled:
+        group = groups.get(group_name)
+        if not isinstance(group, dict):
+            continue
+        group["manual_enabled"] = False
+        group["suggested_by_unity"] = False
+        group["probe_required"] = False
+        group["search_priority"] = 0.0
+        group["search_params"] = []
+        group_params = [
+            str(item)
+            for item in group.get("params", [])
+            if isinstance(item, str)
+        ] + [
+            str(item)
+            for item in group.get("gate_params", [])
+            if isinstance(item, str)
+        ]
+        for param_name in group_params:
+            param = params.get(param_name)
+            if isinstance(param, dict):
+                param["searchable"] = False
+                param["reason"] = "disabled by human laya control group override"
+    payload["manual_laya_control_group_overrides"] = {
+        name: {"enabled": False}
+        for name in sorted(disabled)
+    }
+    return payload
+
+
+def _apply_module_plan_overrides(module_plan: list[Any], overrides: Any) -> list[Any]:
+    disabled = _disabled_laya_control_groups(overrides)
+    out = json.loads(json.dumps(module_plan))
+    for item in out:
+        if not isinstance(item, dict) or str(item.get("group")) not in disabled:
+            continue
+        item["manual_enabled"] = False
+        item["suggested_by_unity"] = False
+        item["probe_required"] = False
+        item["search_priority"] = 0.0
+        item["action"] = "disabled_by_human"
+        item["search_params"] = []
+    return out
+
+
+def _disabled_laya_control_groups(overrides: Any) -> set[str]:
+    if not isinstance(overrides, dict):
+        return set()
+    disabled: set[str] = set()
+    for group_name, raw in overrides.items():
+        if isinstance(raw, dict):
+            enabled = raw.get("enabled", True)
+        else:
+            enabled = raw
+        if enabled is False:
+            disabled.add(str(group_name))
+    return disabled
 
 
 def _format_region(region: Any) -> str:

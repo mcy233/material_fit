@@ -17,11 +17,12 @@ function defaultConfig(): AlgorithmConfig {
     target_score: 0.5,
     apply_lmat: true,
     capture_screen_after_apply: true,
-    rerender_wait_ms: 1500,
+    rerender_wait_ms: 900,
     use_capture_contract: false,
     dry_run: false,
-    fit_score_mode: 'perceptual',
-    optimizer: 'heuristic',
+    fit_score_mode: 'human_accept',
+    auto_adjust_mode: 'fresh_fit',
+    optimizer: 'semantic_group',
     cma_es: {
       mode: 'warm',
       warm_start_iters: 12,
@@ -38,9 +39,10 @@ const form = reactive<AlgorithmConfig>(defaultConfig());
 const isCma = computed(() => form.optimizer === 'cma_cold' || form.optimizer === 'cma_warm');
 
 const optimizerHelp: Record<OptimizerKind, string> = {
-  heuristic: '当前生产算法。stage 调度 + channel-bias 反向修正；适合 0~10 轮短迭代和 lmat 真实写入。',
+  heuristic: '旧的固定 stage 反馈控制器。可解释但没有组级回滚，适合作为对照基线。',
   cma_cold: '黑盒 CMA-ES，从初始 .lmat 开始无任何 prior。适合作为 cma_warm 的对照基线；高维下 200 轮以内可能比 random 还差。',
   cma_warm: 'Warm-Started CMA-ES (Nomura et al., AAAI 2021)。把已有迭代的 (params, fit_score) 当 prior 初始化协方差，合成实验中比 cma_cold 快 2~3×。需要 ≥2 轮历史，否则自动降级到 cma_cold。',
+  semantic_group: '推荐路径。按运行控制台的控件预设缩小搜索空间，做组级探针、接受/拒绝回滚和组内 pattern search。',
 };
 
 async function load(): Promise<void> {
@@ -113,7 +115,8 @@ async function save(): Promise<void> {
             </td>
             <td>
               <select id="cfg-optimizer" v-model="form.optimizer">
-                <option value="heuristic">heuristic（推荐 / 默认）</option>
+                <option value="semantic_group">semantic_group（推荐 / 语义分组搜索）</option>
+                <option value="heuristic">heuristic（旧 stage 基线）</option>
                 <option value="cma_warm">cma_warm（Warm-Started CMA-ES）</option>
                 <option value="cma_cold">cma_cold（vanilla CMA-ES）</option>
               </select>
@@ -200,7 +203,7 @@ async function save(): Promise<void> {
             <td>
               <label for="cfg-target">target_score</label>
               <p class="muted small">
-                fit_score 达到该值即终止。perceptual 模式下 0.5 已经是非常像；linear 模式下要看 RGB_MAE。
+                fit_score 达到该值即终止。human_accept 是当前默认目标；perceptual / linear 主要用于诊断对照。
               </p>
             </td>
             <td>
@@ -211,13 +214,16 @@ async function save(): Promise<void> {
             <td>
               <label for="cfg-mode">fit_score_mode</label>
               <p class="muted small">
-                <strong>perceptual</strong>（推荐）：<span class="mono">1 - sqrt(MAE * 4)</span>，对小 MAE 敏感，MAE 0.21→0.08，0.05→0.55，0.01→0.80。
+                <strong>human_accept</strong>（推荐）：弱化姿态/视角微差带来的像素惩罚，重点比较前景颜色分布和材质统计。
                 <br/>
-                <strong>linear</strong>（旧逻辑）：<span class="mono">1 - MAE</span>，过于宽松，0.21 被认成 0.79，目标 0.5 一上来就触发。
+                <strong>perceptual</strong>：更严格的通道加权 MAE + SSIM，用于诊断。
+                <br/>
+                <strong>linear</strong>（旧逻辑）：<span class="mono">1 - MAE</span>，非常宽松，仅用于对照。
               </p>
             </td>
             <td>
               <select id="cfg-mode" v-model="form.fit_score_mode">
+                <option value="human_accept">human_accept</option>
                 <option value="perceptual">perceptual</option>
                 <option value="linear">linear (legacy)</option>
               </select>

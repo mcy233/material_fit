@@ -13,6 +13,8 @@ const result = ref<PreflightResult | null>(null);
 const running = ref(false);
 const error = ref<string | null>(null);
 const probeParam = ref('u_BaseColor');
+const changeThreshold = ref('');
+const restoreThreshold = ref('');
 // Probe writes to fixed paths (preflight/{baseline,probe,restored}.png),
 // so its image URLs stay constant between runs and the browser
 // happily serves the previous run's cached pixels. Bumping this
@@ -34,6 +36,7 @@ async function load(): Promise<void> {
   if (!props.projectId) return;
   try {
     result.value = await fetchLastLayaRefreshPreflight(props.projectId);
+    syncThresholdInputs(result.value);
     cacheBust.value = Date.now();
     error.value = null;
   } catch (err) {
@@ -46,9 +49,14 @@ async function run(): Promise<void> {
   running.value = true;
   error.value = null;
   try {
+    const change = parseThreshold(changeThreshold.value);
+    const restore = parseThreshold(restoreThreshold.value);
     result.value = await runLayaRefreshPreflight(props.projectId, {
       probe_param: probeParam.value || 'u_BaseColor',
+      ...(change == null ? {} : { mean_diff_change_threshold: change }),
+      ...(restore == null ? {} : { mean_diff_restore_threshold: restore }),
     });
+    syncThresholdInputs(result.value);
     cacheBust.value = Date.now();
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
@@ -68,6 +76,23 @@ function pct(value: number | undefined | null): string {
 function fmtDiff(value: number | undefined | null): string {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '—';
   return value.toFixed(2);
+}
+
+function parseThreshold(value: unknown): number | null {
+  const trimmed = String(value ?? '').trim();
+  if (!trimmed) return null;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function syncThresholdInputs(next: PreflightResult | null): void {
+  if (!next) return;
+  if (!changeThreshold.value && typeof next.mean_diff_change_threshold === 'number') {
+    changeThreshold.value = fmtDiff(next.mean_diff_change_threshold);
+  }
+  if (!restoreThreshold.value && typeof next.mean_diff_restore_threshold === 'number') {
+    restoreThreshold.value = fmtDiff(next.mean_diff_restore_threshold);
+  }
 }
 
 const anyFocusFailed = computed(
@@ -105,6 +130,26 @@ const diffUnderRestore = computed(() => {
       </div>
       <div class="ph-controls">
         <input v-model="probeParam" class="probe-input" placeholder="u_BaseColor" :disabled="running" />
+        <input
+          v-model="changeThreshold"
+          class="probe-input threshold-input"
+          type="number"
+          min="0"
+          step="0.1"
+          placeholder="变化阈值 0.5"
+          title="baseline 到 probe 的最小平均色差；设为 0 表示任意非零色差都算刷新"
+          :disabled="running"
+        />
+        <input
+          v-model="restoreThreshold"
+          class="probe-input threshold-input"
+          type="number"
+          min="0"
+          step="0.1"
+          placeholder="还原阈值 2.5"
+          title="baseline 到 restored 的平均色差必须小于等于该值"
+          :disabled="running"
+        />
         <button class="primary" @click="run" :disabled="!canRun">
           {{ running ? '探测中…' : '运行 Laya 刷新探针' }}
         </button>
@@ -234,6 +279,7 @@ const diffUnderRestore = computed(() => {
   font-family: var(--mono);
   width: 160px;
 }
+.threshold-input { width: 112px; }
 .ph-body { margin-top: 12px; }
 .ph-status {
   display: flex;

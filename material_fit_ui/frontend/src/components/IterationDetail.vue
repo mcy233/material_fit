@@ -69,6 +69,18 @@ const perceptualForegroundRatio = computed(() => {
   const v = am?.foreground_ratio;
   return typeof v === 'number' ? v : null;
 });
+const humanAcceptSignals = computed(() => {
+  const value = perceptualSignals.value?.human_accept;
+  return value && typeof value === 'object' ? (value as Record<string, unknown>) : null;
+});
+const humanAcceptScore = computed(() => {
+  const v = humanAcceptSignals.value?.score;
+  return typeof v === 'number' ? v : null;
+});
+const humanAcceptComponents = computed(() => {
+  const value = humanAcceptSignals.value?.components;
+  return value && typeof value === 'object' ? (value as Record<string, unknown>) : null;
+});
 
 const candidateParamsJson = computed(() => {
   if (!props.detail.candidate_params) return '';
@@ -128,6 +140,9 @@ const headerNote = computed(() => props.detail._note ?? null);
            with the new metric. Older decision.json entries don't have this
            block and the row gracefully hides itself. -->
       <div v-if="detail.kind === 'auto_adjust' && perceptualSignals" class="iter-summary perceptual">
+        <span v-if="humanAcceptScore != null" class="stat-pill stat-pill--accent" title="人类可接受度评分：当前默认优化目标">
+          human <strong>{{ fmt(humanAcceptScore) }}</strong>
+        </span>
         <span class="stat-pill stat-pill--accent" title="加权 MAE = sum(channel_w * channel_mae)，去背景后的 model 像素 MAE">
           weighted MAE <strong>{{ fmt(perceptualWeightedMae) }}</strong>
         </span>
@@ -141,6 +156,17 @@ const headerNote = computed(() => props.detail._note ?? null);
           fg ratio <strong>{{ fmt(perceptualForegroundRatio, 3) }}</strong>
         </span>
         <span class="stat-pill stat-pill--muted small">E-009 指标</span>
+      </div>
+
+      <div v-if="detail.kind === 'auto_adjust' && humanAcceptComponents" class="iter-summary perceptual">
+        <span class="stat-pill stat-pill--muted small">human components</span>
+        <span
+          v-for="(value, key) in humanAcceptComponents"
+          :key="String(key)"
+          class="stat-pill stat-pill--accent"
+        >
+          {{ key }} <strong>{{ fmt(value) }}</strong>
+        </span>
       </div>
 
       <!-- diff_only summary -->

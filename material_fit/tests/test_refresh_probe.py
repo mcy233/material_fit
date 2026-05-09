@@ -83,6 +83,22 @@ def _write_solid_png(path: Path, color: tuple[int, int, int], size: tuple[int, i
     return path
 
 
+def _write_sparse_probe_png(
+    path: Path,
+    *,
+    base: tuple[int, int, int] = (128, 128, 128),
+    probe: tuple[int, int, int] = (255, 0, 255),
+    changed_pixels: int = 10,
+    size: tuple[int, int] = (32, 32),
+) -> Path:
+    img = PIL_Image.new("RGB", size, base)
+    width, height = size
+    for index in range(min(changed_pixels, width * height)):
+        img.putpixel((index % width, index // width), probe)
+    img.save(path, "PNG")
+    return path
+
+
 # ---------------------------------------------------------------------
 # magenta_ratio
 
@@ -204,6 +220,81 @@ def test_run_refresh_probe_detects_frozen_laya(tmp_path: Path):
     assert result.mean_diff_probe_restored == pytest.approx(0.0)
     # Backup should still exist on disk and original .lmat should be unchanged.
     assert lmat_path.read_bytes() == original_bytes
+
+
+def test_run_refresh_probe_reports_weak_signal_below_threshold_without_frozen_label(tmp_path: Path):
+    """A small foreground change can be real but diluted by full-frame
+    averaging. It should fail the configured threshold without claiming
+    the three captures are identical."""
+
+    lmat_path = tmp_path / "m.lmat"
+    _write_minimal_lmat(lmat_path)
+
+    baseline = _write_solid_png(tmp_path / "baseline.png", (128, 128, 128))
+    probe = _write_sparse_probe_png(tmp_path / "probe.png")
+    sequence = {"baseline": baseline, "probe": probe, "restored": baseline}
+
+    result = run_refresh_probe(
+        laya_material_path=lmat_path,
+        capture=lambda step: sequence[step],
+        config=ProbeConfig(rerender_wait_ms=0, mean_diff_change_threshold=1.5),
+        sleep_fn=lambda _: None,
+    )
+
+    assert result.success is False
+    assert result.detected_change is False
+    assert result.detected_restore is True
+    assert 1.0 < result.mean_diff_baseline_probe < 1.5
+    reason_l = result.reason.lower()
+    assert "not produce enough color difference" in reason_l
+    assert "not refreshing" not in reason_l
+
+
+def test_run_refresh_probe_default_threshold_accepts_diluted_visible_change(tmp_path: Path):
+    """The default threshold is intentionally low: a small but real
+    foreground change should be enough to prove Laya refreshed."""
+
+    lmat_path = tmp_path / "m.lmat"
+    _write_minimal_lmat(lmat_path)
+
+    baseline = _write_solid_png(tmp_path / "baseline.png", (128, 128, 128))
+    probe = _write_sparse_probe_png(tmp_path / "probe.png")
+    sequence = {"baseline": baseline, "probe": probe, "restored": baseline}
+
+    result = run_refresh_probe(
+        laya_material_path=lmat_path,
+        capture=lambda step: sequence[step],
+        config=ProbeConfig(rerender_wait_ms=0),
+        sleep_fn=lambda _: None,
+    )
+
+    assert result.success is True, result.reason
+    assert result.detected_change is True
+    assert result.detected_restore is True
+    assert 1.0 < result.mean_diff_baseline_probe < 1.5
+
+
+def test_run_refresh_probe_zero_threshold_accepts_any_nonzero_difference(tmp_path: Path):
+    """When the user sets the threshold to 0, any non-identical probe
+    frame is enough to count as refreshed."""
+
+    lmat_path = tmp_path / "m.lmat"
+    _write_minimal_lmat(lmat_path)
+
+    baseline = _write_solid_png(tmp_path / "baseline.png", (128, 128, 128))
+    probe = _write_sparse_probe_png(tmp_path / "probe.png", changed_pixels=1)
+    sequence = {"baseline": baseline, "probe": probe, "restored": baseline}
+
+    result = run_refresh_probe(
+        laya_material_path=lmat_path,
+        capture=lambda step: sequence[step],
+        config=ProbeConfig(rerender_wait_ms=0, mean_diff_change_threshold=0.0),
+        sleep_fn=lambda _: None,
+    )
+
+    assert result.success is True, result.reason
+    assert result.detected_change is True
+    assert result.mean_diff_baseline_probe > 0.0
 
 
 # ---------------------------------------------------------------------

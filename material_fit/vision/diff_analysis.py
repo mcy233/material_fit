@@ -21,6 +21,7 @@ from .perceptual_score import (
     combine_fit_score,
     ssim_score,
 )
+from .human_accept_score import build_foreground_alignment, build_human_accept_score
 
 
 @dataclass
@@ -112,6 +113,16 @@ def analyze_image_diff(config: ImageDiffConfig) -> dict[str, Any]:
         auto_mask_payload = auto_background_mask(reference, candidate, auto_mask_cfg)
         if auto_mask_payload.status == "ok" and auto_mask_payload.mask is not None:
             auto_mask_array = auto_mask_payload.mask
+
+    human_alignment_payload: dict[str, Any] | None = None
+    if auto_mask_payload is not None:
+        human_alignment_payload = build_foreground_alignment(
+            reference,
+            candidate,
+            reference_bg_color=auto_mask_payload.reference_bg_color,
+            candidate_bg_color=auto_mask_payload.candidate_bg_color,
+            threshold=config.auto_mask_threshold,
+        )
 
     # Experiment E-011: bg normalisation runs *after* mask detection
     # but *before* the per-pixel weighted MAE / SSIM, so:
@@ -269,6 +280,52 @@ def analyze_image_diff(config: ImageDiffConfig) -> dict[str, Any]:
         ssim=ssim_value,
         weights=config.fit_branch_weights,
     )
+    human_accept = build_human_accept_score(
+        global_metrics=global_metrics,
+        channels=channels,
+        weighted_mae=float(weighted["weighted_mae"]),
+        strict_fit_score=float(fit_value),
+        ssim=ssim_value,
+        alignment=human_alignment_payload,
+    )
+    # P0 diagnostics (phase summary 2026-05-08): the fish_1580 post
+    # mortem couldn't tell at a glance whether a flat fit_score came
+    # from saturated metrics, vanishing foreground, or unfixed bg
+    # mismatch. We now surface a tiny `diagnostics` block so the
+    # next "nothing is moving" report can be triaged in seconds:
+    #
+    # * mae_branch_saturated — true if the legacy ``1 - sqrt(4·MAE)``
+    #   curve would clip to 0 here (i.e. weighted_mae > 0.25). Under
+    #   the new exp_decay mapping the live mae_branch is *not* zero,
+    #   but this flag preserves the visibility of the old failure mode.
+    # * foreground_ratio — fraction of pixels that survived the
+    #   intersection-of-foregrounds auto mask. < 0.05 means the mask
+    #   is wrong; < 0.20 typically means scene framing differs.
+    # * bg_color_delta — L2 distance between the reference and
+    #   candidate background colours BEFORE bg_normalize ran. After
+    #   the E-011 substitution this should not affect the score, but
+    #   a huge value here is a hint the bg detector or the rendering
+    #   bg setup might be off.
+    diag_foreground_ratio: float | None = None
+    diag_bg_delta: float | None = None
+    diag_legacy_saturated = bool(fit_components.get("legacy_mae_branch_saturated", False))
+    if auto_mask_payload is not None:
+        if auto_mask_payload.foreground_ratio is not None:
+            diag_foreground_ratio = float(auto_mask_payload.foreground_ratio)
+        ref_bg = auto_mask_payload.reference_bg_color
+        cand_bg = auto_mask_payload.candidate_bg_color
+        if ref_bg is not None and cand_bg is not None:
+            diag_bg_delta = float(
+                math.sqrt(sum((float(a) - float(b)) ** 2 for a, b in zip(ref_bg, cand_bg)))
+            )
+    diagnostics = {
+        "mae_branch_saturated": diag_legacy_saturated,
+        "foreground_ratio": diag_foreground_ratio,
+        "bg_color_delta": diag_bg_delta,
+        "bg_normalize_applied": bool(
+            isinstance(bg_normalize_payload, dict) and bg_normalize_payload.get("enabled")
+        ),
+    }
     perceptual_block = {
         "weighted_mae": weighted["weighted_mae"],
         "weights_used": weighted["weights_used"],
@@ -280,6 +337,7 @@ def analyze_image_diff(config: ImageDiffConfig) -> dict[str, Any]:
         "fit_score": fit_value,
         "fit_components": fit_components,
         "branch_weights": list(config.fit_branch_weights),
+        "diagnostics": diagnostics,
     }
 
     result: dict[str, Any] = {
@@ -299,6 +357,8 @@ def analyze_image_diff(config: ImageDiffConfig) -> dict[str, Any]:
         "material_channels": channels,
         "adjustment_hints": suggestions,
         "perceptual": perceptual_block,
+        "human_accept_score": human_accept["score"],
+        "human_accept": human_accept,
     }
 
     report_path = output_dir / "diff_analysis.json"
