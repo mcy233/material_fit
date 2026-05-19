@@ -16,11 +16,10 @@ Persistence:
 ```
 tools/material_fit/output/<project_id>/
 ├── project.json          # this module owns it
-├── fit_config.json       # generated on demand from project.json (the CLI eats this)
 ├── inputs/               # optional copies of small reference assets
-├── auto_adjust/          # written by fit_material.py per iteration
 ├── jobs/<job_id>.json    # job_manager owns these
-└── preanalysis.json      # preanalysis module owns
+├── preanalysis.json      # preanalysis module owns
+└── runs/<date-settings>/ # one immutable-ish auto-adjust run artifact folder
 ```
 
 We deliberately *do not* delete any of the existing ``case_loader`` paths;
@@ -46,19 +45,29 @@ PROJECT_FILE = "project.json"
 FIT_CONFIG_FILE = "fit_config.json"
 PREANALYSIS_FILE = "preanalysis.json"
 INPUTS_DIR = "inputs"
+CONFIGS_DIR = "configs"
 JOBS_DIR = "jobs"
+RUNS_DIR = "runs"
 
 _PROJECT_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,64}$")
+_IMPORT_FILE_SLOTS: dict[str, str] = {
+    "laya_shader_path": "laya_shader",
+    "unity_shader_path": "unity_shader",
+    "unity_material_params_path": "unity_material_params",
+}
+_UNITY_REFERENCE_DIR = "unity_references"
 
 
 @dataclass(frozen=True)
 class ProjectPaths:
     project_dir: Path
     project_json: Path
+    configs_dir: Path
     fit_config_json: Path
     preanalysis_json: Path
     inputs_dir: Path
     jobs_dir: Path
+    runs_dir: Path
 
 
 def project_paths(project_id: str, config: LoaderConfig) -> ProjectPaths:
@@ -66,10 +75,12 @@ def project_paths(project_id: str, config: LoaderConfig) -> ProjectPaths:
     return ProjectPaths(
         project_dir=project_dir,
         project_json=project_dir / PROJECT_FILE,
-        fit_config_json=project_dir / FIT_CONFIG_FILE,
-        preanalysis_json=project_dir / PREANALYSIS_FILE,
+        configs_dir=project_dir / CONFIGS_DIR,
+        fit_config_json=project_dir / CONFIGS_DIR / FIT_CONFIG_FILE,
+        preanalysis_json=project_dir / CONFIGS_DIR / PREANALYSIS_FILE,
         inputs_dir=project_dir / INPUTS_DIR,
         jobs_dir=project_dir / JOBS_DIR,
+        runs_dir=project_dir / RUNS_DIR,
     )
 
 
@@ -120,6 +131,7 @@ def create_project(
         raise FileExistsError(f"project directory already exists: {project_id}")
     paths.project_dir.mkdir(parents=True, exist_ok=False)
     paths.inputs_dir.mkdir(parents=True, exist_ok=True)
+    paths.configs_dir.mkdir(parents=True, exist_ok=True)
     paths.jobs_dir.mkdir(parents=True, exist_ok=True)
 
     now = _now_iso()
@@ -134,8 +146,14 @@ def create_project(
             "unity_shader_path": None,
             "unity_material_params_path": None,
             "unity_reference_image_path": None,
+            "unity_reference_dir_path": None,
+            "unity_reference_glob": "unity_ref_v*_yaw*_pitch*.png",
             "laya_shader_path": None,
             "laya_material_lmat_path": None,
+            "laya_project_path": None,
+            "laya_capture_command_path": None,
+            "laya_capture_camera_name": "Capture Camera",
+            "laya_capture_target_name": "model",
             "laya_capture_region": None,
             "laya_capture_dir": None,
             "laya_capture_state_file": None,
@@ -159,7 +177,7 @@ def create_project(
             # essentially no downside (we still keep the absolute
             # region as a fallback).
             "laya_capture_anchor": {
-                "enabled": True,
+                "enabled": False,
                 "offset_x": 0,
                 "offset_y": 0,
                 "width": 0,
@@ -170,7 +188,25 @@ def create_project(
             "max_iterations": 6,
             "target_score": 0.5,
             "apply_lmat": True,
-            "capture_screen_after_apply": True,
+            "capture_screen_after_apply": False,
+            "use_laya_editor_capture": True,
+            "laya_editor_capture": {
+                "reload_scene_after_reimport": False,
+                "refresh_after_reimport_delay_ms": 800,
+                "timeout_s": 90,
+                "capture_mode": "rotate_target",
+                "render_backend": "draw_scene",
+                "capture_debug_mode": "normal",
+                "alpha_source": "render_alpha",
+                "alpha_from_rgb_threshold": 1.0,
+                "mask_alpha_mode": "binary",
+                "mask_alpha_threshold": 1.0,
+                "render_texture_srgb": True,
+                "zero_transparent_rgb": False,
+                "align_target_bounds": False,
+                "target_base_yaw": 0.0,
+                "target_base_pitch": 0.0,
+            },
             "rerender_wait_ms": 900,
             "dynamic_rerender_wait": {
                 "enabled": True,
@@ -181,15 +217,23 @@ def create_project(
             "use_capture_contract": False,
             "dry_run": False,
             "fit_score_mode": "human_accept",
+            "multiview_scoring": {
+                "enabled": True,
+                "require_all_views": True,
+                "fit_aggregation": "mean",
+                "diff_aggregation": "mean",
+                "channel_aggregation": "mean_with_worst_severity",
+                "primary_view_id": "v000_yaw0_pitch0",
+            },
             # fresh_fit starts from a controlled baseline before searching;
             # refine_current keeps the current .lmat as-is and only continues
             # local optimization.
             "auto_adjust_mode": "fresh_fit",
-            # E-007: run the magenta-probe refresh check before each
-            # auto-adjust run, to guarantee Laya is actually re-rendering
-            # after .lmat writes. Saves debugging hours when Laya is in
-            # background or some other window stole focus.
-            "laya_refresh_check": True,
+            # Refresh is certified from the project preflight panel. Formal
+            # auto-adjust runs must not write an extra probe value before the
+            # first iteration because that can disturb the intended initial
+            # material state.
+            "laya_refresh_check": False,
             "laya_refresh_probe": {
                 "mean_diff_change_threshold": 0.5,
                 "mean_diff_restore_threshold": 2.5,
@@ -235,6 +279,8 @@ def create_project(
         "preanalysis_path": None,
         "active_job_id": None,
         "last_job_id": None,
+        "active_run_id": None,
+        "last_run_id": None,
     }
     save_project(data, config=config)
     return data
@@ -254,6 +300,11 @@ def save_project(data: dict[str, Any], config: LoaderConfig | None = None) -> di
     data["updated_at"] = _now_iso()
     paths.project_json.parent.mkdir(parents=True, exist_ok=True)
     paths.project_json.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    paths.configs_dir.mkdir(parents=True, exist_ok=True)
+    (paths.configs_dir / PROJECT_FILE).write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return data
 
 
@@ -263,6 +314,93 @@ def patch_project(project_id: str, patch: dict[str, Any], config: LoaderConfig |
     current.pop("_summary", None)
     merged = _deep_merge(current, patch)
     return save_project(merged, config=config)
+
+
+def import_project_input_file(
+    project_id: str,
+    *,
+    input_key: str,
+    source_path: str,
+    config: LoaderConfig | None = None,
+) -> dict[str, Any]:
+    """Copy a movable experiment input into ``output/<project>/inputs``.
+
+    Runtime-owned paths such as the writable Laya ``.lmat`` and Laya project
+    root intentionally do not go through this helper.
+    """
+
+    config = config or LoaderConfig()
+    if input_key not in _IMPORT_FILE_SLOTS:
+        raise ValueError(f"unsupported import input key: {input_key}")
+    project = get_project(project_id, config)
+    project.pop("_summary", None)
+    paths = project_paths(project_id, config)
+    _ensure_within(paths.project_dir, config.output_dir.resolve())
+    source = Path(source_path).resolve()
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(f"input file not found: {source}")
+
+    target_dir = paths.inputs_dir / _IMPORT_FILE_SLOTS[input_key]
+    target = target_dir / source.name
+    if source.parent.resolve() != target_dir.resolve():
+        _reset_directory(target_dir)
+        shutil.copy2(source, target)
+    else:
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+    inputs = dict(project.get("inputs") or {})
+    inputs[input_key] = str(target.resolve())
+    project["inputs"] = inputs
+    return save_project(project, config=config)
+
+
+def import_unity_reference_files(
+    project_id: str,
+    *,
+    source_paths: list[str],
+    config: LoaderConfig | None = None,
+) -> dict[str, Any]:
+    """Copy selected Unity multi-view screenshots into the project inputs."""
+
+    config = config or LoaderConfig()
+    if not source_paths:
+        raise ValueError("source_paths must include at least one file")
+    project = get_project(project_id, config)
+    project.pop("_summary", None)
+    paths = project_paths(project_id, config)
+    _ensure_within(paths.project_dir, config.output_dir.resolve())
+
+    sources: list[Path] = []
+    for raw in source_paths:
+        source = Path(str(raw)).resolve()
+        if not source.exists() or not source.is_file():
+            raise FileNotFoundError(f"Unity reference file not found: {source}")
+        if source.suffix.lower() not in {".png", ".jpg", ".jpeg", ".bmp", ".webp"}:
+            raise ValueError(f"Unity reference must be an image file: {source}")
+        sources.append(source)
+
+    target_dir = paths.inputs_dir / _UNITY_REFERENCE_DIR
+    used_names: set[str] = set()
+    staged: list[tuple[str, bytes | Path]] = []
+    for source in sources:
+        name = _unique_file_name(source.name, used_names)
+        if source.parent.resolve() == target_dir.resolve():
+            staged.append((name, source.read_bytes()))
+        else:
+            staged.append((name, source))
+    _reset_directory(target_dir)
+    for name, source in staged:
+        target = target_dir / name
+        if isinstance(source, bytes):
+            target.write_bytes(source)
+        else:
+            shutil.copy2(source, target)
+
+    inputs = dict(project.get("inputs") or {})
+    inputs["unity_reference_dir_path"] = str(target_dir.resolve())
+    inputs["unity_reference_glob"] = "*.*"
+    project["inputs"] = inputs
+    return save_project(project, config=config)
 
 
 def delete_project(project_id: str, config: LoaderConfig | None = None) -> dict[str, Any]:
@@ -310,18 +448,13 @@ def derive_fit_config(project_id: str, config: LoaderConfig | None = None) -> di
     # absolute paths so fit_material uses them verbatim.
     output_dir_abs = str(paths.project_dir.resolve())
 
+    # The maintained capture path is the Laya Editor script path. The old
+    # desktop-region screenshot flow remains only as internal legacy code, not
+    # as a project-mode default.
+    use_laya_editor_capture = True
     image_pairs: list[dict[str, str]] = []
-    ref = _abs(inputs.get("unity_reference_image_path"))
-    if ref:
-        image_pairs.append(
-            {
-                "reference": ref,
-                "candidate": "latest",
-                "candidate_dir": _abs(inputs.get("laya_capture_dir"))
-                or str((config.image_root / "vision" / "test_image").resolve()),
-                "candidate_prefix": _abs(inputs.get("laya_capture_prefix")) or "laya_candidate",
-            }
-        )
+    # Unity references are now standardized as a multi-view directory. The
+    # legacy single-reference image pair is intentionally no longer derived.
 
     optimizer_value = str(algo.get("optimizer", "heuristic")).strip().lower()
     if optimizer_value not in ("heuristic", "cma_cold", "cma_warm", "semantic_group"):
@@ -346,7 +479,8 @@ def derive_fit_config(project_id: str, config: LoaderConfig | None = None) -> di
         # picks up the mix ratio even if no CLI override is set.
         "hint_bias_mix_ratio": mix_ratio_value,
     }
-    preanalysis = _read_json(paths.preanalysis_json) if paths.preanalysis_json.exists() else None
+    preanalysis_path = paths.preanalysis_json if paths.preanalysis_json.exists() else paths.project_dir / PREANALYSIS_FILE
+    preanalysis = _read_json(preanalysis_path) if preanalysis_path.exists() else None
 
     fit_config: dict[str, Any] = {
         "case_name": project.get("id"),
@@ -356,7 +490,7 @@ def derive_fit_config(project_id: str, config: LoaderConfig | None = None) -> di
         "unity_material_params_path": _abs(inputs.get("unity_material_params_path")),
         "image_pairs": image_pairs,
         "auto_adjust_target_score": float(algo.get("target_score", 0.5)),
-        "capture_screen_after_apply": bool(algo.get("capture_screen_after_apply", False)),
+        "capture_screen_after_apply": False if use_laya_editor_capture else bool(algo.get("capture_screen_after_apply", False)),
         "rerender_wait_ms": int(algo.get("rerender_wait_ms", 900)),
         "dynamic_rerender_wait": algo.get(
             "dynamic_rerender_wait",
@@ -385,7 +519,32 @@ def derive_fit_config(project_id: str, config: LoaderConfig | None = None) -> di
         "dry_run": bool(algo.get("dry_run", False)),
         "render_command": [],
         "laya_capture": {},
+        "laya_editor_capture": {
+            "enabled": use_laya_editor_capture,
+            "laya_project": _abs(inputs.get("laya_project_path")),
+            "command_path": _abs(inputs.get("laya_capture_command_path")),
+            "camera_name": _abs(inputs.get("laya_capture_camera_name")) or "Capture Camera",
+            "target_name": _abs(inputs.get("laya_capture_target_name")) or "model",
+            "capture_mode": "rotate_target",
+            "render_backend": "draw_scene",
+            "capture_debug_mode": "normal",
+            "alpha_source": "render_alpha",
+            "alpha_from_rgb_threshold": 1.0,
+            "mask_alpha_mode": "binary",
+            "mask_alpha_threshold": 1.0,
+            "render_texture_srgb": True,
+            "zero_transparent_rgb": False,
+            "align_target_bounds": False,
+            "reference_dir": _abs(inputs.get("unity_reference_dir_path"))
+            or (_discover_unity_reference_dir(config.project_root) if use_laya_editor_capture else ""),
+            "reference_glob": str(inputs.get("unity_reference_glob") or "unity_ref_v*_yaw*_pitch*.png"),
+            "refresh_assets": [_derive_laya_asset_path(laya_lmat, inputs.get("laya_project_path"))],
+            "target_base_yaw": 0.0,
+            "target_base_pitch": 0.0,
+            **(algo.get("laya_editor_capture") if isinstance(algo.get("laya_editor_capture"), dict) else {}),
+        },
         "fit_score_mode": str(algo.get("fit_score_mode", "human_accept")).lower(),
+        "multiview_scoring": _normalize_multiview_scoring(algo.get("multiview_scoring")),
         "auto_adjust_mode": str(algo.get("auto_adjust_mode", "fresh_fit")).lower(),
         "optimizer": optimizer_value,
         "cma_es": cma_es_payload,
@@ -436,12 +595,16 @@ def _summary(data: dict[str, Any], project_dir: Path, config: LoaderConfig) -> d
         for key in (
             "unity_shader_path",
             "unity_material_params_path",
-            "unity_reference_image_path",
             "laya_capture_region",
         )
         if inputs.get(key)
     )
+    last_run_id = data.get("last_run_id")
     auto_dir = project_dir / "auto_adjust"
+    if isinstance(last_run_id, str) and last_run_id:
+        run_auto_dir = project_dir / RUNS_DIR / last_run_id / "auto_adjust"
+        if run_auto_dir.exists():
+            auto_dir = run_auto_dir
     auto_iters = 0
     if auto_dir.exists():
         for entry in auto_dir.iterdir():
@@ -462,6 +625,8 @@ def _summary(data: dict[str, Any], project_dir: Path, config: LoaderConfig) -> d
         "iterations_count": auto_iters,
         "active_job_id": data.get("active_job_id"),
         "last_job_id": data.get("last_job_id"),
+        "active_run_id": data.get("active_run_id"),
+        "last_run_id": last_run_id,
         "output_dir": _to_rel_posix(project_dir, config.project_root),
     }
 
@@ -489,6 +654,160 @@ def _coerce_optional_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _derive_laya_asset_path(lmat_path: str, laya_project_path: Any) -> str:
+    path = Path(lmat_path)
+    if not path.is_absolute():
+        return lmat_path
+
+    project_path = Path(str(laya_project_path)) if isinstance(laya_project_path, str) and laya_project_path else None
+    if project_path:
+        assets_root = project_path / "assets"
+        try:
+            return path.resolve().relative_to(assets_root.resolve()).as_posix()
+        except ValueError:
+            pass
+
+    parts = path.parts
+    lowered = [part.lower() for part in parts]
+    if "assets" in lowered:
+        index = lowered.index("assets")
+        return Path(*parts[index + 1:]).as_posix()
+    return lmat_path
+
+
+def _derive_laya_target_name(lmat_path: str) -> str:
+    """Return the standardized Laya capture target root.
+
+    The maintained Laya test scene contains exactly one model root named
+    "model", regardless of the source asset id/path.
+    """
+
+    return "model"
+
+
+def list_laya_scene_nodes(project_id: str, config: LoaderConfig | None = None) -> dict[str, Any]:
+    config = config or LoaderConfig()
+    project = get_project(project_id, config)
+    inputs = project.get("inputs") or {}
+    return inspect_laya_scene_nodes(inputs)
+
+
+def inspect_laya_scene_nodes(inputs: dict[str, Any]) -> dict[str, Any]:
+    scene_path = _resolve_laya_scene_path(inputs)
+    nodes: list[dict[str, Any]] = []
+    if scene_path and scene_path.exists():
+        try:
+            payload = json.loads(scene_path.read_text(encoding="utf-8-sig"))
+            _collect_laya_scene_nodes(payload, nodes, parent_path="", parent_active=True)
+        except (OSError, json.JSONDecodeError):
+            nodes = []
+    lmat_target = _derive_laya_target_name(str(inputs.get("laya_material_lmat_path") or ""))
+    active_names = {str(node.get("name")) for node in nodes if node.get("active") is True}
+    recommended_target = (
+        str(inputs.get("laya_capture_target_name") or "")
+        or ("model" if "model" in active_names else "")
+        or (lmat_target if lmat_target in active_names else "")
+        or lmat_target
+        or next((str(node.get("name")) for node in nodes if node.get("active") is True and node.get("type") != "Camera"), "")
+    )
+    recommended_camera = (
+        str(inputs.get("laya_capture_camera_name") or "")
+        or next((str(node.get("name")) for node in nodes if node.get("type") == "Camera" and node.get("name") == "Capture Camera"), "")
+        or next((str(node.get("name")) for node in nodes if node.get("type") == "Camera"), "")
+        or "Capture Camera"
+    )
+    return {
+        "scene_path": str(scene_path) if scene_path else "",
+        "nodes": nodes,
+        "recommended_target_name": recommended_target,
+        "recommended_camera_name": recommended_camera,
+    }
+
+
+def _resolve_laya_scene_path(inputs: dict[str, Any]) -> Path | None:
+    laya_project = inputs.get("laya_project_path")
+    if isinstance(laya_project, str) and laya_project:
+        project_path = Path(laya_project)
+        candidates = [
+            project_path / "assets" / "resources" / "game.ls",
+            project_path / "assets" / "game.ls",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        resources = project_path / "assets" / "resources"
+        if resources.exists():
+            matches = sorted(resources.glob("*.ls"), key=lambda item: item.name)
+            if matches:
+                return matches[0]
+    command_path = inputs.get("laya_capture_command_path")
+    if isinstance(command_path, str) and command_path:
+        path = Path(command_path)
+        assets_root = path.parent if path.parent.name == "assets" else path.parent / "assets"
+        candidate = assets_root / "resources" / "game.ls"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _collect_laya_scene_nodes(
+    node: Any,
+    out: list[dict[str, Any]],
+    *,
+    parent_path: str,
+    parent_active: bool,
+) -> None:
+    if isinstance(node, list):
+        for item in node:
+            _collect_laya_scene_nodes(item, out, parent_path=parent_path, parent_active=parent_active)
+        return
+    if not isinstance(node, dict):
+        return
+    name = node.get("name")
+    node_type = node.get("_$type") or ("Prefab" if node.get("_$prefab") else "")
+    local_active = node.get("active")
+    active = parent_active and (local_active is not False)
+    current_path = f"{parent_path}/{name}" if parent_path and name else (str(name) if name else parent_path)
+    if isinstance(name, str) and name:
+        out.append(
+            {
+                "name": name,
+                "type": str(node_type or ""),
+                "active": active,
+                "path": current_path,
+                "prefab": str(node.get("_$prefab") or ""),
+            }
+        )
+    children = node.get("_$child")
+    if isinstance(children, list):
+        for child in children:
+            _collect_laya_scene_nodes(child, out, parent_path=current_path, parent_active=active)
+
+
+def _discover_unity_reference_dir(project_root: Path) -> str:
+    unity_root = project_root / "tools" / "material_fit" / "unity"
+    if not unity_root.exists():
+        return ""
+    candidates: list[tuple[float, int, Path]] = []
+    for directory in unity_root.rglob("*"):
+        if not directory.is_dir():
+            continue
+        files = [
+            item
+            for item in directory.glob("unity_ref_v*_yaw*_pitch*.png")
+            if item.is_file() and "_mask" not in item.stem
+        ]
+        if not files:
+            continue
+        newest = max(item.stat().st_mtime for item in files)
+        current_bonus = 1 if "current" in directory.name.lower() else 0
+        candidates.append((newest, current_bonus, directory))
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda item: (item[0], item[1], str(item[2])), reverse=True)
+    return str(candidates[0][2].resolve())
 
 
 def _normalize_capture_anchor(value: Any, laya_window_value: Any) -> dict[str, Any]:
@@ -536,6 +855,19 @@ def _normalize_laya_refresh_probe(value: Any) -> dict[str, float]:
     return {
         "mean_diff_change_threshold": change if change is not None and change >= 0.0 else 0.5,
         "mean_diff_restore_threshold": restore if restore is not None and restore >= 0.0 else 2.5,
+    }
+
+
+def _normalize_multiview_scoring(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        value = {}
+    return {
+        "enabled": bool(value.get("enabled", True)),
+        "require_all_views": bool(value.get("require_all_views", True)),
+        "fit_aggregation": str(value.get("fit_aggregation") or "mean"),
+        "diff_aggregation": str(value.get("diff_aggregation") or "mean"),
+        "channel_aggregation": str(value.get("channel_aggregation") or "mean_with_worst_severity"),
+        "primary_view_id": str(value.get("primary_view_id") or "v000_yaw0_pitch0"),
     }
 
 
@@ -691,6 +1023,30 @@ def _ensure_within(target: Path, root: Path) -> None:
         target.resolve().relative_to(root)
     except ValueError as exc:
         raise ValueError(f"path {target} outside of {root}") from exc
+
+
+def _reset_directory(path: Path) -> None:
+    if path.exists():
+        if not path.is_dir():
+            raise ValueError(f"input target is not a directory: {path}")
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _unique_file_name(name: str, used: set[str]) -> str:
+    candidate = Path(name).name
+    if candidate not in used:
+        used.add(candidate)
+        return candidate
+    stem = Path(candidate).stem
+    suffix = Path(candidate).suffix
+    index = 2
+    while True:
+        next_name = f"{stem}_{index}{suffix}"
+        if next_name not in used:
+            used.add(next_name)
+            return next_name
+        index += 1
 
 
 def _now_iso() -> str:

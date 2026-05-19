@@ -2,8 +2,10 @@
 import { computed, ref, watch } from 'vue';
 import type { IterationDetail } from '../types';
 import ImageComparison from './ImageComparison.vue';
+import MultiviewImageGrid from './MultiviewImageGrid.vue';
 import ParamChangesTable from './ParamChangesTable.vue';
 import ChannelMetricsTable from './ChannelMetricsTable.vue';
+import ResearchMetricsPanel from './ResearchMetricsPanel.vue';
 
 const props = defineProps<{ detail: IterationDetail }>();
 
@@ -81,6 +83,15 @@ const humanAcceptComponents = computed(() => {
   const value = humanAcceptSignals.value?.components;
   return value && typeof value === 'object' ? (value as Record<string, unknown>) : null;
 });
+const multiviewSummary = computed(() => decision.value?.multiview_analysis?.summary ?? null);
+const multiviewViews = computed(() => decision.value?.multiview_analysis?.views ?? []);
+const multiviewCount = computed(() => decision.value?.multiview_analysis?.pair_count ?? props.detail.multiview_images?.length ?? 0);
+const researchSignals = computed(() => {
+  const fromDecision = perceptualSignals.value?.research_metrics;
+  if (fromDecision && typeof fromDecision === 'object') return fromDecision as Record<string, unknown>;
+  const fromAnalysis = props.detail.diff_analysis?.research_metrics;
+  return fromAnalysis && typeof fromAnalysis === 'object' ? fromAnalysis as Record<string, unknown> : null;
+});
 
 const candidateParamsJson = computed(() => {
   if (!props.detail.candidate_params) return '';
@@ -122,7 +133,12 @@ const headerNote = computed(() => props.detail._note ?? null);
 
 <template>
   <div>
-    <ImageComparison :images="detail.images" />
+    <MultiviewImageGrid
+      v-if="detail.multiview_images?.length"
+      :items="detail.multiview_images"
+      :title="`${detail.iter_id} · 多视角图像对比 · ${detail.multiview_images.length} views`"
+    />
+    <ImageComparison v-else :images="detail.images" />
 
     <section class="section">
       <h3 class="section-title">本轮 · {{ detail.iter_id }} · {{ headerStage }}</h3>
@@ -135,6 +151,21 @@ const headerNote = computed(() => props.detail._note ?? null);
         <span class="stat-pill">gain <strong>{{ fmt(gain, 3) }}</strong></span>
         <span class="stat-pill">stop <strong>{{ innerDecision?.stop_reason ?? '—' }}</strong></span>
       </div>
+
+      <div v-if="detail.kind === 'auto_adjust' && multiviewSummary" class="iter-summary perceptual">
+        <span class="stat-pill stat-pill--muted small">多视角聚合 · {{ multiviewCount }} views</span>
+        <span class="stat-pill">mean fit <strong>{{ fmt(multiviewSummary.mean_fit_score) }}</strong></span>
+        <span class="stat-pill">worst <strong>{{ multiviewSummary.worst_view_id ?? '—' }}</strong></span>
+        <span class="stat-pill">worst fit <strong>{{ fmt(multiviewSummary.worst_fit_score) }}</strong></span>
+        <span class="stat-pill">p90 loss <strong>{{ fmt(multiviewSummary.p90_loss) }}</strong></span>
+      </div>
+
+      <ResearchMetricsPanel
+        :metrics="researchSignals"
+        :multiview-summary="multiviewSummary"
+        :multiview-views="multiviewViews"
+        :multiview-count="multiviewCount"
+      />
 
       <!-- E-009 perceptual signals: only present once a run has executed
            with the new metric. Older decision.json entries don't have this
@@ -214,6 +245,9 @@ const headerNote = computed(() => props.detail._note ?? null);
       </div>
 
       <div v-show="activeTab === 'channels' && detail.diff_analysis">
+        <p v-if="detail.kind === 'auto_adjust' && decision?.multiview_analysis" class="muted small" style="margin-bottom: 8px;">
+          这是多视角聚合通道分析；优化器使用的也是这份聚合信号，不再只取第一视角。
+        </p>
         <p v-if="diffAnalysisOnly" class="muted small" style="margin-bottom: 8px;">
           这是一次性 <span class="mono">analyze_diff</span> 的产物，没有 decision，仅展示通道分析。
         </p>

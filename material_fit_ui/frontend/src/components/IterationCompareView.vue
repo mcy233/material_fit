@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue';
 import type { IterationDetail, IterationSummary, ParamChange } from '../types';
 import { fetchIterationDetail } from '../api';
 import ImageComparison from './ImageComparison.vue';
+import MultiviewImageGrid from './MultiviewImageGrid.vue';
 
 const props = defineProps<{ caseId: string; iterations: IterationSummary[] }>();
 
@@ -150,6 +151,8 @@ function summarize(detail: IterationDetail | null) {
     iter: detail.iter_id,
     fit: dec?.fit_score_before ?? null,
     mae: dec?.diff_score_before ?? detail.diff_analysis?.score ?? null,
+    worstView: dec?.multiview_analysis?.summary?.worst_view_id ?? null,
+    worstFit: dec?.multiview_analysis?.summary?.worst_fit_score ?? null,
     stage: dec?.selected_stage ?? null,
     changes: inner?.changes?.length ?? 0,
     stop: inner?.stop_reason ?? null,
@@ -196,10 +199,16 @@ function summarize(detail: IterationDetail | null) {
         <div class="iter-summary" v-if="leftSummary">
           <span class="stat-pill">fit <strong>{{ fmt(leftSummary.fit) }}</strong></span>
           <span class="stat-pill">mae <strong>{{ fmt(leftSummary.mae) }}</strong></span>
+          <span v-if="leftSummary.worstView" class="stat-pill">worst <strong>{{ leftSummary.worstView }} · {{ fmt(leftSummary.worstFit) }}</strong></span>
           <span class="stat-pill">changes <strong>{{ leftSummary.changes }}</strong></span>
           <span v-if="leftSummary.stop" class="stat-pill">stop <strong>{{ leftSummary.stop }}</strong></span>
         </div>
-        <ImageComparison v-if="leftDetail" :images="leftDetail.images" :context-label="leftDetail.iter_id" />
+        <MultiviewImageGrid
+          v-if="leftDetail?.multiview_images?.length"
+          :items="leftDetail.multiview_images"
+          :title="`${leftDetail.iter_id} · 多视角对比 · ${leftDetail.multiview_images.length} views`"
+        />
+        <ImageComparison v-else-if="leftDetail" :images="leftDetail.images" :context-label="leftDetail.iter_id" />
       </section>
 
       <section class="compare-side">
@@ -212,10 +221,16 @@ function summarize(detail: IterationDetail | null) {
         <div class="iter-summary" v-if="rightSummary">
           <span class="stat-pill">fit <strong>{{ fmt(rightSummary.fit) }}</strong></span>
           <span class="stat-pill">mae <strong>{{ fmt(rightSummary.mae) }}</strong></span>
+          <span v-if="rightSummary.worstView" class="stat-pill">worst <strong>{{ rightSummary.worstView }} · {{ fmt(rightSummary.worstFit) }}</strong></span>
           <span class="stat-pill">changes <strong>{{ rightSummary.changes }}</strong></span>
           <span v-if="rightSummary.stop" class="stat-pill">stop <strong>{{ rightSummary.stop }}</strong></span>
         </div>
-        <ImageComparison v-if="rightDetail" :images="rightDetail.images" :context-label="rightDetail.iter_id" />
+        <MultiviewImageGrid
+          v-if="rightDetail?.multiview_images?.length"
+          :items="rightDetail.multiview_images"
+          :title="`${rightDetail.iter_id} · 多视角对比 · ${rightDetail.multiview_images.length} views`"
+        />
+        <ImageComparison v-else-if="rightDetail" :images="rightDetail.images" :context-label="rightDetail.iter_id" />
       </section>
     </div>
 

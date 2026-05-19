@@ -1,4 +1,4 @@
-import type { LayaControlSchemaPresetList, PreanalysisPayload, PreflightResult } from '../types';
+import type { LayaControlSchemaPresetList, LayaProbeOptions, PreanalysisPayload, PreflightResult } from '../types';
 import { getJson, sendJson } from './client';
 
 export const runPreanalysis = (
@@ -48,3 +48,6 @@ export const runLayaRefreshPreflight = (
     'POST',
     payload,
   );
+
+export const fetchLayaProbeOptions = (projectId: string): Promise<LayaProbeOptions> =>
+  getJson<LayaProbeOptions>(`/api/projects/${encodeURIComponent(projectId)}/preflight/laya_probe_options`);

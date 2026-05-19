@@ -21,6 +21,7 @@ from .perceptual_score import (
     combine_fit_score,
     ssim_score,
 )
+from .research_metrics import aggregate_research_metrics, build_research_metrics
 from .human_accept_score import build_foreground_alignment, build_human_accept_score
 
 
@@ -78,6 +79,8 @@ def analyze_image_diff(config: ImageDiffConfig) -> dict[str, Any]:
 
     try:
         reference, candidate, mask = load_rgba_pair(config.reference_path, config.candidate_path, config.mask_path)
+        research_reference = reference.copy()
+        research_candidate = candidate.copy()
         from PIL import Image
         import numpy as np
     except ImportError:
@@ -339,6 +342,12 @@ def analyze_image_diff(config: ImageDiffConfig) -> dict[str, Any]:
         "branch_weights": list(config.fit_branch_weights),
         "diagnostics": diagnostics,
     }
+    research_metrics = build_research_metrics(
+        research_reference,
+        research_candidate,
+        explicit_mask=mask,
+        fallback_mask=auto_mask_array,
+    )
 
     result: dict[str, Any] = {
         "status": "ok",
@@ -357,6 +366,7 @@ def analyze_image_diff(config: ImageDiffConfig) -> dict[str, Any]:
         "material_channels": channels,
         "adjustment_hints": suggestions,
         "perceptual": perceptual_block,
+        "research_metrics": research_metrics,
         "human_accept_score": human_accept["score"],
         "human_accept": human_accept,
     }
@@ -396,6 +406,162 @@ def analyze_image_pairs(pairs: Iterable[dict[str, Any]], output_dir: str | Path)
         json.dumps(aggregate, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return aggregate
+
+
+def analyze_multiview_pairs(
+    pairs: Iterable[dict[str, Any]],
+    output_dir: str | Path,
+    *,
+    fit_score_mode: str = "human_accept",
+    aggregation_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Analyze multi-view render pairs and build a strategy-compatible aggregate.
+
+    The returned ``strategy_analysis`` intentionally keeps the same top-level
+    shape as :func:`analyze_image_diff`, so existing optimizers can consume it
+    without knowing whether the signal came from one view or many.
+    """
+
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    aggregation = aggregation_config if isinstance(aggregation_config, dict) else {}
+    pair_items = list(pairs)
+    analyses: list[dict[str, Any]] = []
+    views: list[dict[str, Any]] = []
+    for index, pair in enumerate(pair_items):
+        pair_dir = output_root / f"pair_{index:02d}"
+        result = analyze_image_diff(
+            ImageDiffConfig(
+                reference_path=pair["reference"],
+                candidate_path=pair["candidate"],
+                mask_path=pair.get("mask"),
+                output_dir=pair_dir,
+            )
+        )
+        diff_score = _finite_float(result.get("score"), math.inf)
+        fit_score = _resolve_view_fit_score(result, diff_score, fit_score_mode)
+        view_id = str(pair.get("view_id") or pair.get("id") or f"view_{index:03d}")
+        view_payload = {
+            "pair_index": index,
+            "view_id": view_id,
+            "reference": str(pair.get("reference", "")),
+            "candidate": str(pair.get("candidate", "")),
+            "mask": str(pair.get("mask", "")) if pair.get("mask") else "",
+            "analysis_dir": str(pair_dir),
+            "analysis_path": str(result.get("report_path") or pair_dir / "diff_analysis.json"),
+            "diff_image_path": str(result.get("diff_image_path") or ""),
+            "diff_score": diff_score,
+            "fit_score": fit_score,
+            "perceptual_fit_score": _optional_float(result.get("perceptual_fit_score")),
+            "human_accept_score": _optional_float(result.get("human_accept_score")),
+            "research_score": _optional_float((result.get("research_metrics") or {}).get("score") if isinstance(result.get("research_metrics"), dict) else None),
+            "research_loss": _optional_float((result.get("research_metrics") or {}).get("loss") if isinstance(result.get("research_metrics"), dict) else None),
+            "research_valid": (
+                (result.get("research_metrics") or {}).get("validity", {}).get("passed")
+                if isinstance(result.get("research_metrics"), dict)
+                and isinstance(result.get("research_metrics", {}).get("validity"), dict)
+                else None
+            ),
+            "research_metrics": result.get("research_metrics") if isinstance(result.get("research_metrics"), dict) else None,
+            "status": str(result.get("status") or ""),
+        }
+        analyses.append(result)
+        views.append(view_payload)
+
+    ok_analyses = [item for item in analyses if item.get("status") == "ok"]
+    ok_views = [
+        view
+        for view in views
+        if math.isfinite(_finite_float(view.get("diff_score"), math.inf))
+        or math.isfinite(_finite_float(view.get("fit_score"), -math.inf))
+    ]
+    diff_scores = [_finite_float(view.get("diff_score"), math.inf) for view in ok_views]
+    fit_scores = [_finite_float(view.get("fit_score"), -math.inf) for view in ok_views]
+    diff_mean = _mean(diff_scores)
+    fit_mean = _mean(fit_scores)
+    fit_min = _min_finite(fit_scores, default=-math.inf)
+    fit_max = _max_finite(fit_scores, default=-math.inf)
+    fit_p10 = _percentile_finite(fit_scores, 10.0, default=-math.inf)
+    loss_values = [1.0 - score for score in fit_scores if math.isfinite(score)]
+    p90_loss = _percentile_finite(loss_values, 90.0, default=math.inf)
+    worst_view = _worst_fit_view(ok_views)
+
+    base_analysis = dict(ok_analyses[0]) if ok_analyses else {
+        "status": "pending",
+        "metric": "material_oriented_multiview_diff_v1",
+        "score": math.inf,
+    }
+    aggregate_channels = _aggregate_strategy_channels(ok_analyses)
+    aggregate_perceptual = _aggregate_perceptual(ok_analyses)
+    aggregate_human = _aggregate_human_accept(ok_analyses)
+    aggregate_research = aggregate_research_metrics(
+        [
+            item.get("research_metrics")
+            for item in ok_analyses
+            if isinstance(item.get("research_metrics"), dict)
+        ]
+    )
+    strategy_analysis = dict(base_analysis)
+    strategy_analysis["metric"] = "material_oriented_multiview_diff_v1"
+    strategy_analysis["score"] = diff_mean
+    if math.isfinite(fit_mean):
+        strategy_analysis["perceptual_fit_score"] = fit_mean
+    if aggregate_human:
+        strategy_analysis["human_accept"] = aggregate_human
+        if isinstance(aggregate_human.get("score"), (int, float)):
+            strategy_analysis["human_accept_score"] = float(aggregate_human["score"])
+    strategy_analysis["material_channels"] = aggregate_channels
+    strategy_analysis["adjustment_hints"] = _build_adjustment_hints(aggregate_channels)
+    if aggregate_perceptual:
+        strategy_analysis["perceptual"] = aggregate_perceptual
+    if aggregate_research:
+        strategy_analysis["research_metrics"] = aggregate_research
+    strategy_analysis["global"] = _aggregate_metric_dicts([item.get("global") for item in ok_analyses])
+    strategy_analysis["regions"] = _aggregate_regions(ok_analyses)
+
+    summary = {
+        "mean_diff_score": diff_mean,
+        "mean_fit_score": fit_mean,
+        "min_fit_score": fit_min,
+        "max_fit_score": fit_max,
+        "p10_fit_score": fit_p10,
+        "p90_loss": p90_loss,
+        "worst_view_id": worst_view.get("view_id") if worst_view else "",
+        "worst_fit_score": worst_view.get("fit_score") if worst_view else None,
+        "research_score": aggregate_research.get("score") if isinstance(aggregate_research, dict) else None,
+        "research_loss": aggregate_research.get("loss") if isinstance(aggregate_research, dict) else None,
+        "research_valid_view_count": aggregate_research.get("valid_view_count") if isinstance(aggregate_research, dict) else None,
+        "research_invalid_view_count": aggregate_research.get("invalid_view_count") if isinstance(aggregate_research, dict) else None,
+    }
+    multiview = {
+        "version": 1,
+        "status": "ok" if ok_analyses else "pending",
+        "aggregation": {
+            "fit": str(aggregation.get("fit_aggregation") or "mean"),
+            "diff": str(aggregation.get("diff_aggregation") or "mean"),
+            "channels": str(aggregation.get("channel_aggregation") or "mean_with_worst_severity"),
+        },
+        "pair_count": len(pair_items),
+        "ok_count": len(ok_analyses),
+        "diff_scores": diff_scores,
+        "fit_scores": fit_scores,
+        "views": views,
+        "summary": summary,
+    }
+    strategy_analysis["multiview"] = multiview
+    report = {
+        "status": multiview["status"],
+        "pairs": analyses,
+        "views": views,
+        "summary": summary,
+        "multiview_analysis": multiview,
+        "strategy_analysis": strategy_analysis,
+    }
+    (output_root / "multi_view_diff_analysis.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return report
 
 
 class _Accumulator:
@@ -580,6 +746,218 @@ def _aggregate_channels(results: list[dict[str, Any]]) -> dict[str, Any]:
             "worst_severity": _worst_severity(value.get("severity", "none") for value in valid_values),
         }
     return aggregate
+
+
+def _aggregate_strategy_channels(results: list[dict[str, Any]]) -> dict[str, Any]:
+    if not results:
+        return {}
+    keys = sorted({key for result in results for key in result.get("material_channels", {}).keys()})
+    aggregate: dict[str, Any] = {}
+    for key in keys:
+        values = [
+            result.get("material_channels", {}).get(key, {})
+            for result in results
+            if isinstance(result.get("material_channels"), dict)
+        ]
+        valid_values = [value for value in values if isinstance(value, dict) and value.get("valid")]
+        if not valid_values:
+            aggregate[key] = {"valid": False, "severity": "none", "rgb_mae": 0.0}
+            continue
+        related_params: list[str] = []
+        for value in valid_values:
+            for param in value.get("related_params", []) if isinstance(value.get("related_params"), list) else []:
+                if isinstance(param, str) and param not in related_params:
+                    related_params.append(param)
+        rgb_biases = [value.get("rgb_bias_candidate_minus_reference") for value in valid_values]
+        aggregate[key] = {
+            "name": valid_values[0].get("name") or key,
+            "valid": True,
+            "severity": _worst_severity(value.get("severity", "none") for value in valid_values),
+            "rgb_mae": _mean(value.get("rgb_mae", 0.0) for value in valid_values),
+            "avg_rgb_mae": _mean(value.get("rgb_mae", 0.0) for value in valid_values),
+            "max_rgb_mae": _max_finite((value.get("rgb_mae", 0.0) for value in valid_values), default=0.0),
+            "luma_bias_candidate_minus_reference": _mean(
+                value.get("luma_bias_candidate_minus_reference", 0.0) for value in valid_values
+            ),
+            "saturation_bias_candidate_minus_reference": _mean(
+                value.get("saturation_bias_candidate_minus_reference", 0.0) for value in valid_values
+            ),
+            "contrast_bias_candidate_minus_reference": _mean(
+                value.get("contrast_bias_candidate_minus_reference", 0.0) for value in valid_values
+            ),
+            "rgb_bias_candidate_minus_reference": _mean_vector(rgb_biases, 3),
+            "related_params": related_params,
+            "view_count": len(valid_values),
+        }
+        for extra_key in ("center_luma_signed", "edge_luma_signed", "edge_minus_center_luma_bias"):
+            if any(extra_key in value for value in valid_values):
+                aggregate[key][extra_key] = _mean(value.get(extra_key, 0.0) for value in valid_values)
+    return aggregate
+
+
+def _aggregate_perceptual(results: list[dict[str, Any]]) -> dict[str, Any]:
+    perceptuals = [item.get("perceptual") for item in results if isinstance(item.get("perceptual"), dict)]
+    if not perceptuals:
+        return {}
+    base = dict(perceptuals[0])
+    for key in ("weighted_mae", "ssim", "fit_score"):
+        base[key] = _mean(item.get(key, math.inf) for item in perceptuals)
+    base["diagnostics"] = _aggregate_diagnostics([item.get("diagnostics") for item in perceptuals])
+    base["view_count"] = len(perceptuals)
+    return base
+
+
+def _aggregate_human_accept(results: list[dict[str, Any]]) -> dict[str, Any]:
+    items = [item.get("human_accept") for item in results if isinstance(item.get("human_accept"), dict)]
+    if not items:
+        scores = [item.get("human_accept_score") for item in results]
+        mean_score = _mean(score for score in scores if isinstance(score, (int, float)))
+        return {"score": mean_score, "view_count": len(scores)} if math.isfinite(mean_score) else {}
+    base = dict(items[0])
+    base["score"] = _mean(item.get("score", math.inf) for item in items)
+    base["view_count"] = len(items)
+    return base
+
+
+def _aggregate_diagnostics(items: Iterable[Any]) -> dict[str, Any]:
+    dicts = [item for item in items if isinstance(item, dict)]
+    if not dicts:
+        return {}
+    keys = sorted({key for item in dicts for key in item.keys()})
+    out: dict[str, Any] = {}
+    for key in keys:
+        values = [item.get(key) for item in dicts]
+        if all(isinstance(value, bool) for value in values if value is not None):
+            out[key] = any(bool(value) for value in values)
+        else:
+            numeric = [
+                float(value)
+                for value in values
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+            ]
+            if numeric:
+                out[key] = sum(numeric) / len(numeric)
+            else:
+                out[key] = next((value for value in values if value is not None), None)
+    return out
+
+
+def _aggregate_regions(results: list[dict[str, Any]]) -> dict[str, Any]:
+    keys = sorted({
+        key
+        for result in results
+        if isinstance(result.get("regions"), dict)
+        for key in result["regions"].keys()
+    })
+    return {
+        key: _aggregate_metric_dicts(
+            result.get("regions", {}).get(key)
+            for result in results
+            if isinstance(result.get("regions"), dict)
+        )
+        for key in keys
+    }
+
+
+def _aggregate_metric_dicts(items: Iterable[Any]) -> dict[str, Any]:
+    dicts = [item for item in items if isinstance(item, dict) and item.get("valid")]
+    if not dicts:
+        return {"valid": False, "pixels": 0}
+    out: dict[str, Any] = {"valid": True}
+    numeric_keys = sorted({
+        key
+        for item in dicts
+        for key, value in item.items()
+        if isinstance(value, (int, float)) and key != "valid"
+    })
+    for key in numeric_keys:
+        out[key] = _mean(item.get(key, math.inf) for item in dicts)
+    vector_keys = sorted({
+        key
+        for item in dicts
+        for key, value in item.items()
+        if isinstance(value, list) and value and all(isinstance(v, (int, float)) for v in value)
+    })
+    for key in vector_keys:
+        max_len = max(len(item.get(key, [])) for item in dicts)
+        out[key] = _mean_vector((item.get(key) for item in dicts), max_len)
+    return out
+
+
+def _resolve_view_fit_score(analysis: dict[str, Any], diff_score: float, mode: str) -> float:
+    if mode == "human_accept":
+        value = analysis.get("human_accept_score")
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return max(0.0, min(1.0, float(value)))
+    if mode in ("human_accept", "perceptual"):
+        value = analysis.get("perceptual_fit_score")
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return max(0.0, min(1.0, float(value)))
+    if not math.isfinite(diff_score):
+        return -math.inf
+    mae = max(0.0, float(diff_score))
+    if mode == "perceptual":
+        return max(0.0, min(1.0, 1.0 - math.sqrt(mae * 4.0)))
+    return max(0.0, min(1.0, 1.0 - mae))
+
+
+def _finite_float(value: Any, default: float) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return default
+    return numeric if math.isfinite(numeric) else default
+
+
+def _optional_float(value: Any) -> float | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
+def _mean_vector(values: Iterable[Any], length: int) -> list[float]:
+    vectors = [
+        [float(item) for item in value[:length]]
+        for value in values
+        if isinstance(value, list) and len(value) >= length and all(isinstance(item, (int, float)) for item in value[:length])
+    ]
+    if not vectors:
+        return [0.0] * length
+    return [sum(vector[index] for vector in vectors) / len(vectors) for index in range(length)]
+
+
+def _min_finite(values: Iterable[float], *, default: float) -> float:
+    finite = [float(value) for value in values if math.isfinite(float(value))]
+    return min(finite) if finite else default
+
+
+def _max_finite(values: Iterable[float], *, default: float) -> float:
+    finite = [float(value) for value in values if math.isfinite(float(value))]
+    return max(finite) if finite else default
+
+
+def _percentile_finite(values: Iterable[float], percentile: float, *, default: float) -> float:
+    finite = sorted(float(value) for value in values if math.isfinite(float(value)))
+    if not finite:
+        return default
+    if len(finite) == 1:
+        return finite[0]
+    position = (len(finite) - 1) * max(0.0, min(100.0, percentile)) / 100.0
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return finite[int(position)]
+    ratio = position - lower
+    return finite[lower] * (1.0 - ratio) + finite[upper] * ratio
+
+
+def _worst_fit_view(views: list[dict[str, Any]]) -> dict[str, Any] | None:
+    finite = [view for view in views if math.isfinite(_finite_float(view.get("fit_score"), -math.inf))]
+    if not finite:
+        return None
+    return min(finite, key=lambda view: _finite_float(view.get("fit_score"), math.inf))
 
 
 def _mean(values: Iterable[float]) -> float:

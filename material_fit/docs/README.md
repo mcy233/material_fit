@@ -21,6 +21,8 @@
 
 ## 工具和实验
 
+- [File_Layout_And_Artifacts.md](File_Layout_And_Artifacts.md)：测试产物、run 目录、`.lmat` 备份与输出文件管理约定。
+- [Laya_Multiview_Capture.md](Laya_Multiview_Capture.md)：Laya 相机离屏多视角截图脚本与本地接收服务。
 - [MaterialAutoFitTool.md](MaterialAutoFitTool.md)：工具总体说明。
 - [ExperimentLog.md](ExperimentLog.md)：实验编号、修复记录和关键决策。
 - [Experiment_Phase1_CMA_ES_WarmStart.md](Experiment_Phase1_CMA_ES_WarmStart.md)：CMA-ES warm start 实验。

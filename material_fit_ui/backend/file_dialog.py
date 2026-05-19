@@ -31,7 +31,8 @@ def pick(
     """Run the native dialog helper and return ``{"path": "<abs path>"}``.
 
     Empty ``path`` means the user cancelled. The function itself does not
-    raise on cancellation; callers decide how to interpret it.
+    raise on cancellation; callers decide how to interpret it. ``open_many``
+    additionally returns ``{"paths": [...]}``.
     """
 
     payload = {

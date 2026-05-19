@@ -2,6 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue';
 import { fetchPreanalysis, fetchProject, runPreanalysis, setManualMapping } from '../api';
 import type { ParamMappingRow, PreanalysisPayload, ProjectDetail } from '../types';
+import LayaControlSchemaPanel from './LayaControlSchemaPanel.vue';
 
 const props = defineProps<{ projectId: string }>();
 
@@ -172,14 +173,11 @@ function percent(value: number | null | undefined): string {
   return `${(value * 100).toFixed(0)}%`;
 }
 
-function actionLabel(action: string): string {
-  switch (action) {
-    case 'optimize_group': return '直接优化';
-    case 'activate_gate_then_probe': return '激活后探针';
-    case 'probe_optional': return '可选探针';
-    case 'skip_low_confidence': return '低优先级';
-    default: return action || '—';
-  }
+function onSchemaSaved(next: PreanalysisPayload): void {
+  data.value = next;
+  void fetchProject(props.projectId).then((nextProject) => {
+    project.value = nextProject;
+  }).catch(() => {});
 }
 </script>
 
@@ -216,44 +214,14 @@ function actionLabel(action: string): string {
         </p>
       </section>
 
-      <section v-if="modulePlan.length" class="section">
-        <h3 class="section-title">模块搜索计划</h3>
-        <p class="muted small">
-          这里是预分析真正用于后续调参的结果：先识别 Unity 开启了哪些功能板块，再决定 Laya 哪些模块需要激活、探针或进入优化。
-        </p>
-        <div class="module-grid">
-          <article
-            v-for="entry in modulePlan"
-            :key="entry.group"
-            class="module-card"
-            :class="{ suggested: entry.suggested_by_unity, inactive: !entry.current_active }"
-          >
-            <div class="module-head">
-              <strong class="mono">{{ entry.group }}</strong>
-              <span class="status-pill" :class="entry.probe_required ? 'status-unity_only' : entry.suggested_by_unity ? 'status-curated' : 'status-laya_only'">
-                {{ actionLabel(entry.action) }}
-              </span>
-            </div>
-            <div class="stats compact">
-              <span class="stat-pill">priority <strong>{{ percent(entry.search_priority) }}</strong></span>
-              <span class="stat-pill">active <strong>{{ entry.current_active ? 'yes' : 'no' }}</strong></span>
-              <span class="stat-pill">params <strong>{{ entry.search_params.length }}/{{ entry.params_count }}</strong></span>
-            </div>
-            <p class="muted small">
-              Unity 功能：
-              <span class="mono">{{ entry.unity_features.join(', ') || '—' }}</span>
-            </p>
-            <p class="muted small">
-              gate:
-              <span class="mono">{{ [...entry.define_gates, ...entry.gate_params].join(', ') || '—' }}</span>
-            </p>
-            <code class="param-list">{{ entry.search_params.join(', ') || '—' }}</code>
-            <ul v-if="entry.evidence.length" class="evidence-list">
-              <li v-for="evidence in entry.evidence" :key="evidence">{{ evidence }}</li>
-            </ul>
-          </article>
-        </div>
-      </section>
+      <LayaControlSchemaPanel
+        v-if="data.laya_control_groups?.length"
+        :project-id="props.projectId"
+        :groups="data.laya_control_groups"
+        :module-plan="modulePlan"
+        :manual-schema="data.manual_laya_control_schema"
+        @saved="onSchemaSaved"
+      />
 
       <section v-if="unityFeatures.length" class="section">
         <h3 class="section-title">Unity 功能模块摘要</h3>
@@ -490,16 +458,6 @@ function actionLabel(action: string): string {
 .stats.compact { gap: 4px; margin: 6px 0; }
 .warning-list { margin: 4px 0 0; padding-left: 22px; color: var(--warn); }
 .error-text { color: var(--bad); }
-.module-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 10px; margin-top: 8px; }
-.module-card {
-  background: var(--bg-panel);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 10px;
-}
-.module-card.suggested { border-color: rgba(63, 185, 80, 0.55); }
-.module-card.inactive { background: rgba(210, 153, 34, 0.04); }
-.module-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .phenomenon-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px; margin-top: 8px; }
 .phenomenon-card {
   background: var(--bg-panel);

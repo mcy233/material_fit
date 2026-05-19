@@ -1,0 +1,28 @@
+{
+  "camera_name": "MaterialFitCamera",
+  "target_name": "1580_lvbu_skin_prefab",
+  "width": 900,
+  "height": 700,
+  "fov": 35,
+  "capture_mode": "auto",
+  "distance_scale": 2.2,
+  "min_distance": 1.0,
+  "yaw_offset": 0,
+  "pitch_offset": 0,
+  "target_yaw_sign": -1,
+  "target_pitch_sign": -1,
+  "views": [
+    {
+      "view_id": "v000_yaw0_pitch0",
+      "yaw": 0,
+      "pitch": 0,
+      "file_name": "laya_v000_yaw0_pitch0.png"
+    },
+    {
+      "view_id": "v001_yaw45_pitch0",
+      "yaw": 45,
+      "pitch": 0,
+      "file_name": "laya_v001_yaw45_pitch0.png"
+    }
+  ]
+}

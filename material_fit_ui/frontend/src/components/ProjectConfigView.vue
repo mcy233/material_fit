@@ -3,19 +3,16 @@ import { computed, onMounted, ref, watch } from 'vue';
 import {
   deleteProject,
   externalPreviewUrl,
+  fetchLayaSceneNodes,
   fetchProject,
+  importProjectInputFile,
+  importUnityReferenceFiles,
   patchProject,
   pickFile,
-  pickRegion,
+  unityReferenceFiles as fetchUnityReferenceFiles,
 } from '../api';
-import type { CaptureRegion, LayaCaptureAnchor, LayaWindowConfig, ProjectDetail, ProjectInputs } from '../types';
+import type { FileInfo, LayaSceneNode, LayaSceneNodesPayload, ProjectDetail, ProjectInputs } from '../types';
 import RefreshPreflightCard from './RefreshPreflightCard.vue';
-
-const defaultLayaWindow: LayaWindowConfig = {
-  process_pattern: 'LayaAirIDE',
-  title_pattern: '',
-  settle_ms: 250,
-};
 
 const props = defineProps<{ projectId: string }>();
 const emit = defineEmits<{
@@ -26,7 +23,8 @@ const emit = defineEmits<{
 const project = ref<ProjectDetail | null>(null);
 const error = ref<string | null>(null);
 const saving = ref(false);
-const pickingRegion = ref(false);
+const unityReferenceFiles = ref<FileInfo[]>([]);
+const sceneNodes = ref<LayaSceneNodesPayload | null>(null);
 
 interface Slot {
   key: keyof ProjectInputs;
@@ -36,7 +34,10 @@ interface Slot {
   filetypes: [string, string][];
   image?: boolean;
   isDir?: boolean;
+  mode: 'import_file' | 'real_path' | 'unity_refs';
 }
+
+type ImportableInputKey = 'laya_shader_path' | 'unity_shader_path' | 'unity_material_params_path';
 
 const slots: Slot[] = [
   {
@@ -45,6 +46,7 @@ const slots: Slot[] = [
     hint: '.shader / .vs / .fs',
     required: true,
     filetypes: [['Laya shader', '*.shader *.vs *.fs'], ['All files', '*.*']],
+    mode: 'import_file',
   },
   {
     key: 'laya_material_lmat_path',
@@ -52,6 +54,7 @@ const slots: Slot[] = [
     hint: '调参会写入此文件（自动备份 .bak）',
     required: true,
     filetypes: [['Laya material', '*.lmat'], ['All files', '*.*']],
+    mode: 'real_path',
   },
   {
     key: 'unity_shader_path',
@@ -59,29 +62,32 @@ const slots: Slot[] = [
     hint: 'Unity ShaderLab .shader',
     required: false,
     filetypes: [['Unity shader', '*.shader'], ['All files', '*.*']],
+    mode: 'import_file',
   },
   {
     key: 'unity_material_params_path',
     label: 'Unity 材质参数 JSON',
-    hint: 'Editor 工具导出的实际参数',
+    hint: '可选：Editor 工具导出的实际参数；未提供时不阻塞 Laya 预分析/探针',
     required: false,
     filetypes: [['JSON', '*.json'], ['All files', '*.*']],
+    mode: 'import_file',
   },
   {
-    key: 'unity_reference_image_path',
-    label: 'Unity 参考图',
-    hint: '同视角同光照下的 Unity PNG',
+    key: 'unity_reference_dir_path',
+    label: 'Unity 多视角参考截图',
+    hint: '多选参考截图并复制到项目 inputs/unity_references/；正式评分只使用这组项目内副本',
     required: false,
-    image: true,
-    filetypes: [['PNG image', '*.png *.jpg *.jpeg *.bmp'], ['All files', '*.*']],
+    filetypes: [['Images', '*.png *.jpg *.jpeg *.bmp *.webp'], ['All files', '*.*']],
+    mode: 'unity_refs',
   },
   {
-    key: 'laya_capture_dir',
-    label: 'Laya 截图保存目录',
-    hint: '默认 tools/material_fit/vision/test_image',
+    key: 'laya_project_path',
+    label: 'Laya 项目目录',
+    hint: '包含 assets/ 的 Laya 项目根目录；用于推导资源相对路径和 command 位置',
     required: false,
     filetypes: [],
     isDir: true,
+    mode: 'real_path',
   },
 ];
 
@@ -90,6 +96,7 @@ async function load(): Promise<void> {
   try {
     const data = await fetchProject(props.projectId);
     project.value = data;
+    await Promise.all([loadUnityReferenceFiles(data), loadLayaSceneNodes()]);
     error.value = null;
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
@@ -103,16 +110,56 @@ async function pickSlot(slot: Slot): Promise<void> {
   if (!project.value) return;
   try {
     const result = await pickFile({
-      mode: slot.isDir ? 'directory' : 'open',
+      mode: slot.mode === 'unity_refs' ? 'open_many' : slot.isDir ? 'directory' : 'open',
       title: slot.label,
       initial_dir: slotInitialDir(slot.key),
       filetypes: slot.isDir ? undefined : slot.filetypes,
     });
     if (result.error) { error.value = result.error; return; }
+    if (slot.mode === 'unity_refs') {
+      const paths = result.paths ?? [];
+      if (!paths.length) return;
+      await importUnityReferences(paths);
+      return;
+    }
     if (!result.path) return;
+    if (slot.mode === 'import_file') {
+      await importInputFile(slot.key as ImportableInputKey, result.path);
+      return;
+    }
     await save({ inputs: { [slot.key]: result.path } });
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
+  }
+}
+
+async function importInputFile(inputKey: ImportableInputKey, sourcePath: string): Promise<void> {
+  if (!project.value) return;
+  saving.value = true;
+  try {
+    project.value = await importProjectInputFile(project.value.id, inputKey, sourcePath);
+    await Promise.all([loadUnityReferenceFiles(project.value), loadLayaSceneNodes()]);
+    emit('changed');
+    error.value = null;
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    saving.value = false;
+  }
+}
+
+async function importUnityReferences(sourcePaths: string[]): Promise<void> {
+  if (!project.value) return;
+  saving.value = true;
+  try {
+    project.value = await importUnityReferenceFiles(project.value.id, sourcePaths);
+    await Promise.all([loadUnityReferenceFiles(project.value), loadLayaSceneNodes()]);
+    emit('changed');
+    error.value = null;
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    saving.value = false;
   }
 }
 
@@ -120,96 +167,13 @@ async function clearSlot(key: keyof ProjectInputs): Promise<void> {
   await save({ inputs: { [key]: null } });
 }
 
-async function pickRegionOnScreen(): Promise<void> {
-  pickingRegion.value = true;
-  error.value = null;
-  try {
-    const window = layaWindow.value;
-    const result = await pickRegion({
-      laya_window: {
-        process_pattern: window.process_pattern,
-        title_pattern: window.title_pattern,
-      },
-    });
-    if (result.error) {
-      error.value = result.error;
-      return;
-    }
-    if (result.region) {
-      const inputsPatch: Record<string, unknown> = {
-        laya_capture_region: result.region as CaptureRegion,
-      };
-      // If the backend was able to find the Laya window at pick time
-      // it already computed (offset_x, offset_y, width, height) — save
-      // them so future captures survive Laya window drags. If it
-      // couldn't (laya_window pattern stale), keep the user's existing
-      // anchor and surface the error so they can fix the pattern.
-      if (result.anchor) {
-        inputsPatch.laya_capture_anchor = {
-          enabled: project.value?.inputs.laya_capture_anchor?.enabled ?? true,
-          offset_x: result.anchor.offset_x,
-          offset_y: result.anchor.offset_y,
-          width: result.anchor.width,
-          height: result.anchor.height,
-        };
-      } else if (result.anchor_error) {
-        error.value = result.anchor_error;
-      }
-      await save({ inputs: inputsPatch });
-    }
-  } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
-  } finally {
-    pickingRegion.value = false;
-  }
+async function saveReferenceGlob(value: string): Promise<void> {
+  await save({ inputs: { unity_reference_glob: value || 'unity_ref_v*_yaw*_pitch*.png' } });
 }
 
-const captureAnchor = computed<LayaCaptureAnchor>(() => {
-  const fromProject = project.value?.inputs?.laya_capture_anchor;
-  if (fromProject && typeof fromProject === 'object') {
-    return {
-      enabled: fromProject.enabled ?? true,
-      offset_x: fromProject.offset_x ?? 0,
-      offset_y: fromProject.offset_y ?? 0,
-      width: fromProject.width ?? 0,
-      height: fromProject.height ?? 0,
-    };
-  }
-  return { enabled: true, offset_x: 0, offset_y: 0, width: 0, height: 0 };
-});
-
-const anchorReady = computed(() => captureAnchor.value.width > 0 && captureAnchor.value.height > 0);
-
-async function toggleAnchor(): Promise<void> {
-  await save({
-    inputs: {
-      laya_capture_anchor: {
-        ...captureAnchor.value,
-        enabled: !captureAnchor.value.enabled,
-      },
-    },
-  });
-}
-
-async function clearRegion(): Promise<void> {
-  await save({ inputs: { laya_capture_region: null } });
-}
-
-const layaWindow = computed<LayaWindowConfig>(() => {
-  const fromProject = project.value?.inputs?.laya_window;
-  if (fromProject && typeof fromProject === 'object') {
-    return {
-      process_pattern: fromProject.process_pattern ?? defaultLayaWindow.process_pattern,
-      title_pattern: fromProject.title_pattern ?? defaultLayaWindow.title_pattern,
-      settle_ms: typeof fromProject.settle_ms === 'number' ? fromProject.settle_ms : defaultLayaWindow.settle_ms,
-    };
-  }
-  return { ...defaultLayaWindow };
-});
-
-async function saveLayaWindow(patch: Partial<LayaWindowConfig>): Promise<void> {
-  const merged: LayaWindowConfig = { ...layaWindow.value, ...patch };
-  await save({ inputs: { laya_window: merged } });
+async function saveCaptureName(key: 'laya_capture_camera_name' | 'laya_capture_target_name', value: string): Promise<void> {
+  await save({ inputs: { [key]: value.trim() || null } });
+  await loadLayaSceneNodes();
 }
 
 async function save(patch: Record<string, unknown>): Promise<void> {
@@ -217,6 +181,7 @@ async function save(patch: Record<string, unknown>): Promise<void> {
   saving.value = true;
   try {
     project.value = await patchProject(project.value.id, patch);
+    await Promise.all([loadUnityReferenceFiles(project.value), loadLayaSceneNodes()]);
     emit('changed');
     error.value = null;
   } catch (err) {
@@ -256,10 +221,60 @@ function shorten(value: string | null | undefined): string {
   return value.slice(0, 30) + ' … ' + value.slice(-65);
 }
 
-const referenceImageUrl = computed(() => {
-  const path = project.value?.inputs.unity_reference_image_path;
-  return path ? externalPreviewUrl(path) : null;
+const editorCaptureEnabled = computed(() => true);
+
+const referencePreviewItems = computed(() => {
+  if (unityReferenceFiles.value.length > 0) {
+    return unityReferenceFiles.value.slice(0, 3).map((file) => ({
+      name: file.name || file.path,
+      url: externalPreviewUrl(file.path),
+    }));
+  }
+  return [];
 });
+
+async function loadUnityReferenceFiles(data: ProjectDetail | null): Promise<void> {
+  if (!data) return;
+  try {
+    const result = await fetchUnityReferenceFiles(
+      data.inputs.unity_reference_dir_path || '',
+      data.inputs.unity_reference_glob || 'unity_ref_v*_yaw*_pitch*.png',
+      32,
+    );
+    unityReferenceFiles.value = result.files.filter((file) => /\.(png|jpe?g|bmp)$/i.test(file.name || file.path));
+  } catch {
+    unityReferenceFiles.value = [];
+  }
+}
+
+async function loadLayaSceneNodes(): Promise<void> {
+  if (!props.projectId) return;
+  try {
+    sceneNodes.value = await fetchLayaSceneNodes(props.projectId);
+  } catch {
+    sceneNodes.value = null;
+  }
+}
+
+const targetOptions = computed<LayaSceneNode[]>(() => (
+  (sceneNodes.value?.nodes ?? [])
+    .filter((node) => node.name && node.type !== 'Camera')
+    .sort((a, b) => Number(b.active) - Number(a.active) || a.name.localeCompare(b.name))
+));
+
+const cameraOptions = computed<LayaSceneNode[]>(() => (
+  (sceneNodes.value?.nodes ?? [])
+    .filter((node) => node.name && node.type === 'Camera')
+    .sort((a, b) => Number(b.active) - Number(a.active) || a.name.localeCompare(b.name))
+));
+
+const captureTargetName = computed(() => (
+  project.value?.inputs.laya_capture_target_name || sceneNodes.value?.recommended_target_name || ''
+));
+
+const captureCameraName = computed(() => (
+  project.value?.inputs.laya_capture_camera_name || sceneNodes.value?.recommended_camera_name || 'Capture Camera'
+));
 </script>
 
 <template>
@@ -291,7 +306,7 @@ const referenceImageUrl = computed(() => {
                 <span v-if="slot.required" class="required">*</span>
               </span>
               <div class="slot-actions">
-                <button @click="pickSlot(slot)">选择…</button>
+                <button @click="pickSlot(slot)">{{ slot.mode === 'real_path' ? '选择…' : '导入…' }}</button>
                 <button v-if="project.inputs[slot.key]" class="ghost" @click="clearSlot(slot.key)">清除</button>
               </div>
             </div>
@@ -303,117 +318,102 @@ const referenceImageUrl = computed(() => {
         </div>
       </section>
 
-      <section v-if="referenceImageUrl" class="section">
-        <h3 class="section-title">Unity 参考图预览</h3>
-        <div class="ref-preview">
-          <img :src="referenceImageUrl" alt="unity reference" />
-        </div>
-      </section>
-
       <section class="section">
-        <h3 class="section-title">Laya 截图区域</h3>
-        <div class="region-row">
-          <button class="primary" @click="pickRegionOnScreen" :disabled="pickingRegion || saving">
-            {{ pickingRegion ? '请在屏幕上拖动…' : project.inputs.laya_capture_region ? '重新框选' : '在屏幕上框选…' }}
-          </button>
-          <button v-if="project.inputs.laya_capture_region" class="ghost" @click="clearRegion" :disabled="saving">清除</button>
-          <div class="region-display-inline">
-            <template v-if="project.inputs.laya_capture_region">
-              <span class="region-pill">x <strong>{{ project.inputs.laya_capture_region.x }}</strong></span>
-              <span class="region-pill">y <strong>{{ project.inputs.laya_capture_region.y }}</strong></span>
-              <span class="region-pill">width <strong>{{ project.inputs.laya_capture_region.width }}</strong></span>
-              <span class="region-pill">height <strong>{{ project.inputs.laya_capture_region.height }}</strong></span>
-            </template>
-            <span v-else class="muted small">未框选 — 点上面的按钮，鼠标拖一个矩形即可。Esc 取消。</span>
-          </div>
-        </div>
-        <p class="muted small" style="margin-top: 6px;">
-          每轮调参 apply 之后，按这个矩形从主屏幕抓取 Laya 渲染窗口。点"在屏幕上框选…"会弹出一个全屏半透明 overlay，
-          鼠标拖一个矩形选中 Laya 编辑器/预览窗口的渲染区域，松开鼠标即保存。
-        </p>
-
-        <div class="anchor-row">
-          <label class="anchor-toggle">
-            <input
-              type="checkbox"
-              :checked="captureAnchor.enabled"
-              @change="toggleAnchor"
-              :disabled="saving"
-            />
-            <span>
-              <strong>锚定到 Laya 窗口</strong>
-              <span class="muted small" style="margin-left: 6px;">
-                启用后：每次截屏前查询 Laya 窗口当前位置，以"框选时记录的窗口偏移"为基准重算绝对坐标——这样你之后拖动/缩放 Laya 窗口都不会让截图跑偏。
-              </span>
-            </span>
-          </label>
-          <div class="anchor-status" :class="{ ok: anchorReady, pending: !anchorReady }">
-            <template v-if="anchorReady">
-              偏移已记录：
-              <span class="region-pill">dx <strong>{{ captureAnchor.offset_x }}</strong></span>
-              <span class="region-pill">dy <strong>{{ captureAnchor.offset_y }}</strong></span>
-              <span class="region-pill">w <strong>{{ captureAnchor.width }}</strong></span>
-              <span class="region-pill">h <strong>{{ captureAnchor.height }}</strong></span>
-            </template>
-            <template v-else>
-              偏移未记录（需要点一次"在屏幕上框选…"，框选时后端会同时记录 Laya 窗口位置）
-            </template>
-          </div>
-        </div>
-      </section>
-
-      <section class="section">
-        <h3 class="section-title">Laya 窗口聚焦</h3>
+        <h3 class="section-title">Laya 截图相机与旋转目标</h3>
         <p class="muted small" style="margin: 0 0 8px;">
-          Laya 编辑器在<strong>窗口失焦时会暂停渲染</strong>——后续每轮调参的截图都会拿到旧帧、让 fit_score 失真。
-          下面这两条匹配规则用来在每次 .lmat 写入和每次截屏之前，自动把 Laya 窗口拉到前台。
-          <span class="mono">process_pattern</span> 默认 <span class="mono">LayaAirIDE</span>；
-          <span class="mono">title_pattern</span> 填你<strong>正在 Laya 编辑器里打开的那个项目名</strong>（注意这跟左侧 UI 的项目 id 通常不一样，
-          以 Laya 编辑器窗口标题栏显示的为准）。同时打开多个 Laya 项目时尤其要填，否则可能聚焦到错的那个。
+          探针和正式多视角截图都会使用这里的设置。规范场景中 target_name 固定为 model；多视角模式会旋转该节点。
         </p>
-        <div class="window-grid">
-          <label class="window-field">
-            <span class="window-label">process_pattern</span>
-            <input
-              :value="layaWindow.process_pattern"
-              @change="(e) => saveLayaWindow({ process_pattern: (e.target as HTMLInputElement).value })"
-              class="window-input"
-              placeholder="LayaAirIDE"
-              :disabled="saving"
-            />
+        <div class="capture-grid">
+          <label class="capture-field">
+            <span>截图相机 camera_name</span>
+            <div class="capture-row">
+              <select
+                :value="captureCameraName"
+                :disabled="saving"
+                @change="saveCaptureName('laya_capture_camera_name', ($event.target as HTMLSelectElement).value)"
+              >
+                <option value="">自动推荐</option>
+                <option
+                  v-for="node in cameraOptions"
+                  :key="node.path"
+                  :value="node.name"
+                >
+                  {{ node.name }}{{ node.active ? '' : '（inactive）' }}
+                </option>
+              </select>
+              <input
+                :value="captureCameraName"
+                placeholder="Capture Camera"
+                @change="saveCaptureName('laya_capture_camera_name', ($event.target as HTMLInputElement).value)"
+              />
+            </div>
           </label>
-          <label class="window-field">
-            <span class="window-label">title_pattern</span>
-            <input
-              :value="layaWindow.title_pattern"
-              @change="(e) => saveLayaWindow({ title_pattern: (e.target as HTMLInputElement).value })"
-              class="window-input"
-              placeholder="例如 effect / fish — 跟 Laya 编辑器标题栏一致"
-              :disabled="saving"
-            />
-          </label>
-          <label class="window-field">
-            <span class="window-label">settle_ms</span>
-            <input
-              :value="layaWindow.settle_ms"
-              @change="(e) => saveLayaWindow({ settle_ms: Number((e.target as HTMLInputElement).value) || 0 })"
-              class="window-input window-input--num"
-              type="number"
-              min="0"
-              step="50"
-              :disabled="saving"
-            />
+          <label class="capture-field">
+            <span>旋转目标 target_name <strong class="required">*</strong></span>
+            <div class="capture-row">
+              <select
+                :value="captureTargetName"
+                :disabled="saving"
+                @change="saveCaptureName('laya_capture_target_name', ($event.target as HTMLSelectElement).value)"
+              >
+                <option value="">自动推荐</option>
+                <option
+                  v-for="node in targetOptions"
+                  :key="node.path"
+                  :value="node.name"
+                >
+                  {{ node.name }}{{ node.active ? '' : '（inactive）' }}
+                </option>
+              </select>
+              <input
+                :value="captureTargetName"
+                placeholder="model"
+                @change="saveCaptureName('laya_capture_target_name', ($event.target as HTMLInputElement).value)"
+              />
+            </div>
           </label>
         </div>
-        <p class="muted small" style="margin-top: 6px;">
-          settle_ms 是切到前台之后等 Laya 把新一帧画出来的时间。默认 250ms，慢机器可调到 500。设 <span class="mono">process_pattern</span> 为空字符串可以禁用聚焦（不推荐）。
+        <p class="muted small" style="margin: 8px 0 0;">
+          场景：<span class="mono">{{ sceneNodes?.scene_path || '未解析到 game.ls' }}</span> ·
+          推荐 target：<span class="mono">{{ sceneNodes?.recommended_target_name || '—' }}</span>
         </p>
+      </section>
+
+      <section v-if="referencePreviewItems.length" class="section">
+        <h3 class="section-title">Unity 参考图预览</h3>
+        <p v-if="unityReferenceFiles.length" class="muted small" style="margin: 0 0 8px;">
+          当前使用项目内 Unity 多视角参考图，共 {{ unityReferenceFiles.length }} 张；这里只预览前三张，正式评分会按文件名里的 view id 匹配 Laya 多视角截图。
+        </p>
+        <div class="ref-preview" :class="{ 'ref-preview-grid': referencePreviewItems.length > 1 }">
+          <figure v-for="item in referencePreviewItems" :key="item.url" class="ref-item">
+            <img :src="item.url" :alt="item.name" />
+            <figcaption class="mono small">{{ item.name }}</figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <section class="section">
+        <h3 class="section-title">多视角参考匹配</h3>
+        <p class="muted small" style="margin: 0 0 8px;">
+          启用 Laya Editor 后台多视角截图时，工具会从项目 inputs/unity_references 按 glob 找参考图，
+          并用文件名里的 <span class="mono">v000_yaw0_pitch0</span> 这类 view id 匹配 Laya 截图。
+        </p>
+        <label class="window-field">
+          <span class="window-label">unity_reference_glob</span>
+          <input
+            :value="project.inputs.unity_reference_glob || 'unity_ref_v*_yaw*_pitch*.png'"
+            @change="(e) => saveReferenceGlob((e.target as HTMLInputElement).value)"
+            class="window-input"
+            placeholder="unity_ref_v*_yaw*_pitch*.png"
+            :disabled="saving"
+          />
+        </label>
       </section>
 
       <RefreshPreflightCard
         :project-id="project.id"
         :lmat-path="project.inputs.laya_material_lmat_path"
-        :region-filled="!!project.inputs.laya_capture_region"
+        :editor-capture-enabled="editorCaptureEnabled"
       />
 
       <section class="section">
@@ -465,7 +465,31 @@ const referenceImageUrl = computed(() => {
 .slot-value.filled { color: var(--good); }
 
 .ref-preview { background: #0d1117; padding: 8px; border-radius: var(--radius); border: 1px solid var(--border); }
-.ref-preview img { max-width: 100%; max-height: 360px; display: block; margin: 0 auto; }
+.ref-preview-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
+.ref-item { margin: 0; }
+.ref-item img { max-width: 100%; max-height: 360px; display: block; margin: 0 auto; }
+.ref-preview-grid .ref-item img { max-height: 180px; }
+.ref-item figcaption { margin-top: 4px; color: var(--text-dim); text-align: center; word-break: break-all; }
+
+.capture-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.capture-field { display: flex; flex-direction: column; gap: 6px; }
+.capture-field > span { font-weight: 600; font-size: 13px; }
+.capture-row { display: grid; grid-template-columns: minmax(140px, 0.7fr) minmax(140px, 1fr); gap: 6px; }
+.capture-row select,
+.capture-row input {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 12px;
+  min-width: 0;
+}
+@media (max-width: 900px) {
+  .capture-grid,
+  .capture-row { grid-template-columns: 1fr; }
+}
 
 .region-row {
   display: flex;

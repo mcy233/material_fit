@@ -51,9 +51,9 @@ Contract coverage:
        all of ``auto_mask``, ``perceptual``, ``perceptual_fit_score``
        fields.
 
-* :mod:`fit_material` integration
-    1. :func:`_resolve_fit_score` prefers ``perceptual_fit_score``
-       when present and falls back to ``_diff_score_to_fit_score``
+* :mod:`auto_adjust.scoring` integration
+    1. :func:`resolve_fit_score` prefers ``perceptual_fit_score``
+       when present and falls back to ``diff_score_to_fit_score``
        otherwise.
 """
 
@@ -78,8 +78,10 @@ from tools.material_fit.vision import perceptual_score as ps
 from tools.material_fit.vision.diff_analysis import (
     ImageDiffConfig,
     analyze_image_diff,
+    analyze_multiview_pairs,
 )
-from tools.material_fit.fit_material import _resolve_fit_score
+from tools.material_fit.auto_adjust.scoring import resolve_fit_score
+from tools.material_fit.vision.research_metrics import aggregate_research_metrics, build_research_metrics
 
 
 # ---------------------------------------------------------------------
@@ -98,6 +100,15 @@ def _foreground_on_background(fg_color, bg_color, size=(64, 48), fg_box=(20, 14,
     for y in range(fg_box[1], fg_box[3]):
         for x in range(fg_box[0], fg_box[2]):
             px[x, y] = tuple(fg_color)
+    return img
+
+
+def _rgba_foreground(fg_color, size=(64, 48), fg_box=(20, 14, 44, 34)):
+    img = PIL_Image.new("RGBA", size, (0, 0, 0, 0))
+    px = img.load()
+    for y in range(fg_box[1], fg_box[3]):
+        for x in range(fg_box[0], fg_box[2]):
+            px[x, y] = tuple(fg_color) + (255,)
     return img
 
 
@@ -156,6 +167,79 @@ def test_auto_mask_handles_shape_mismatch():
     res = ps.auto_background_mask(ref, cand)
     assert res.status == "unavailable"
     assert res.mask is None
+
+
+# ---------------------------------------------------------------------
+# research metrics P0
+# ---------------------------------------------------------------------
+
+
+def test_research_metrics_identical_rgba_scores_perfect():
+    ref = _rgba_foreground((200, 40, 30))
+    cand = _rgba_foreground((200, 40, 30))
+
+    res = build_research_metrics(ref, cand)
+
+    assert res["status"] == "ok"
+    assert res["validity"]["passed"] is True
+    assert math.isclose(res["score"], 100.0, abs_tol=1e-6)
+    assert math.isclose(res["loss"], 0.0, abs_tol=1e-6)
+    assert math.isclose(res["scientific"]["color_accuracy"]["mean_deltaE00"], 0.0, abs_tol=1e-6)
+    assert math.isclose(res["scientific"]["luminance_structure"]["luminance_mae"], 0.0, abs_tol=1e-6)
+    assert "highlight_reflection" in res["scientific"]
+    assert "detail_texture" in res["scientific"]
+    assert "perceptual_optional" in res["scientific"]
+    assert res["scientific"]["perceptual_optional"]["enters_loss"] is False
+
+
+def test_research_metrics_detects_bbox_misalignment():
+    ref = _rgba_foreground((200, 40, 30), fg_box=(20, 14, 44, 34))
+    cand = _rgba_foreground((200, 40, 30), fg_box=(28, 14, 52, 34))
+
+    res = build_research_metrics(ref, cand)
+
+    assert res["status"] == "ok"
+    assert res["validity"]["passed"] is False
+    assert res["validity"]["mask_iou"] < 0.99
+    assert res["validity"]["bbox_center_error_px"] > 0
+
+
+def test_research_metrics_multiview_aggregation():
+    good = build_research_metrics(_rgba_foreground((200, 40, 30)), _rgba_foreground((200, 40, 30)))
+    shifted = build_research_metrics(
+        _rgba_foreground((200, 40, 30), fg_box=(20, 14, 44, 34)),
+        _rgba_foreground((180, 60, 45), fg_box=(20, 14, 44, 34)),
+    )
+
+    agg = aggregate_research_metrics([good, shifted])
+
+    assert agg["status"] == "ok"
+    assert agg["valid_view_count"] == 2
+    assert 0.0 <= agg["loss"] <= 1.0
+    assert 0.0 <= agg["score"] <= 100.0
+
+
+def test_research_metrics_p1_enters_loss_p2_does_not():
+    ref = _rgba_foreground((120, 120, 120), size=(64, 48), fg_box=(16, 12, 48, 36))
+    cand = _rgba_foreground((120, 120, 120), size=(64, 48), fg_box=(16, 12, 48, 36))
+    ref_px = ref.load()
+    cand_px = cand.load()
+    for y in range(16, 24):
+        for x in range(30, 38):
+            ref_px[x, y] = (255, 255, 255, 255)
+            cand_px[x, y] = (150, 150, 150, 255)
+    for y in range(12, 36):
+        for x in range(16, 48):
+            if (x + y) % 4 == 0:
+                cand_px[x, y] = (80, 80, 80, 255)
+
+    res = build_research_metrics(ref, cand)
+
+    assert res["status"] == "ok"
+    assert "highlight" in res["components"] or res["scientific"]["highlight_reflection"]["status"] == "not_applicable"
+    assert "detail_texture" in res["components"]
+    assert res["scientific"]["perceptual_optional"]["enters_loss"] is False
+    assert "flip_like_error" in res["scientific"]["perceptual_optional"]
 
 
 # ---------------------------------------------------------------------
@@ -341,6 +425,13 @@ def test_analyze_image_diff_emits_e009_blocks(tmp_path):
     assert "human_accept_score" in res
     assert isinstance(res["human_accept_score"], float)
     assert 0.0 <= res["human_accept_score"] <= 1.0
+    assert "research_metrics" in res
+    assert res["research_metrics"]["status"] == "ok"
+    assert res["research_metrics"]["mask_source"] in {"alpha", "explicit_mask", "fallback_mask", "full_image"}
+    assert 0.0 <= res["research_metrics"]["loss"] <= 1.0
+    assert 0.0 <= res["research_metrics"]["score"] <= 100.0
+    assert "color_accuracy" in res["research_metrics"]["scientific"]
+    assert "luminance_structure" in res["research_metrics"]["scientific"]
     assert res["human_accept"]["metric"] in {
         "human_accept_material_score_v1",
         "human_accept_material_score_v2",
@@ -377,8 +468,39 @@ def test_analyze_image_diff_respects_explicit_mask(tmp_path):
     assert res["auto_mask"] is None
 
 
+def test_analyze_multiview_pairs_emits_research_summary(tmp_path):
+    pairs = []
+    for index, cand_color in enumerate([(220, 60, 40), (200, 70, 55)]):
+        ref = _rgba_foreground((220, 60, 40), size=(64, 48))
+        cand = _rgba_foreground(cand_color, size=(64, 48))
+        ref_path = tmp_path / f"ref_{index}.png"
+        cand_path = tmp_path / f"cand_{index}.png"
+        ref.save(ref_path)
+        cand.save(cand_path)
+        pairs.append(
+            {
+                "view_id": f"v{index:03d}_yaw{index * 45}_pitch0",
+                "reference": str(ref_path),
+                "candidate": str(cand_path),
+            }
+        )
+
+    res = analyze_multiview_pairs(pairs, tmp_path / "mv")
+
+    summary = res["multiview_analysis"]["summary"]
+    assert 0.0 <= summary["research_loss"] <= 1.0
+    assert 0.0 <= summary["research_score"] <= 100.0
+    assert summary["research_valid_view_count"] == 2
+    assert "research_metrics" in res["strategy_analysis"]
+    assert res["strategy_analysis"]["research_metrics"]["status"] == "ok"
+    for view in res["views"]:
+        assert 0.0 <= view["research_score"] <= 100.0
+        assert 0.0 <= view["research_loss"] <= 1.0
+        assert view["research_valid"] is True
+
+
 # ---------------------------------------------------------------------
-# fit_material._resolve_fit_score
+# auto_adjust.scoring.resolve_fit_score
 # ---------------------------------------------------------------------
 
 
@@ -387,7 +509,7 @@ def test_resolve_fit_score_prefers_perceptual_fit_score():
         "score": 0.20,  # legacy MAE
         "perceptual_fit_score": 0.42,
     }
-    res = _resolve_fit_score(analysis, diff_score=0.20, mode="perceptual")
+    res = resolve_fit_score(analysis, diff_score=0.20, mode="perceptual")
     assert math.isclose(res, 0.42, abs_tol=1e-9)
 
 
@@ -397,13 +519,13 @@ def test_resolve_fit_score_prefers_human_accept_score():
         "perceptual_fit_score": 0.42,
         "human_accept_score": 0.67,
     }
-    res = _resolve_fit_score(analysis, diff_score=0.20, mode="human_accept")
+    res = resolve_fit_score(analysis, diff_score=0.20, mode="human_accept")
     assert math.isclose(res, 0.67, abs_tol=1e-9)
 
 
 def test_resolve_fit_score_falls_back_when_perceptual_missing():
     analysis = {"score": 0.20}
-    res = _resolve_fit_score(analysis, diff_score=0.20, mode="perceptual")
+    res = resolve_fit_score(analysis, diff_score=0.20, mode="perceptual")
     expected = 1.0 - math.sqrt(0.20 * 4.0)
     expected = max(0.0, min(1.0, expected))
     assert math.isclose(res, expected, abs_tol=1e-9)
@@ -412,6 +534,6 @@ def test_resolve_fit_score_falls_back_when_perceptual_missing():
 def test_resolve_fit_score_clamps_to_unit_interval():
     # An out-of-range perceptual_fit_score must be clamped.
     analysis = {"score": 0.0, "perceptual_fit_score": 1.5}
-    assert _resolve_fit_score(analysis, diff_score=0.0) == 1.0
+    assert resolve_fit_score(analysis, diff_score=0.0) == 1.0
     analysis2 = {"score": 0.0, "perceptual_fit_score": -0.4}
-    assert _resolve_fit_score(analysis2, diff_score=0.0) == 0.0
+    assert resolve_fit_score(analysis2, diff_score=0.0) == 0.0

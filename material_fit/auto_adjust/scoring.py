@@ -72,4 +72,18 @@ def extract_perceptual_signals(analysis: dict[str, Any]) -> dict[str, Any]:
             "reference_bg_color": auto_mask.get("reference_bg_color"),
             "candidate_bg_color": auto_mask.get("candidate_bg_color"),
         }
+    research = analysis.get("research_metrics")
+    if isinstance(research, dict):
+        out["research_metrics"] = {
+            "status": research.get("status"),
+            "score": research.get("score"),
+            "loss": research.get("loss"),
+            "validity": research.get("validity"),
+            "scientific": research.get("scientific"),
+            "components": research.get("components"),
+            "weights": research.get("weights"),
+            "valid_view_count": research.get("valid_view_count"),
+            "invalid_view_count": research.get("invalid_view_count"),
+            "aggregated_scientific": research.get("aggregated_scientific"),
+        }
     return out

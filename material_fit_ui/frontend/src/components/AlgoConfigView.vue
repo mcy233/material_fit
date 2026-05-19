@@ -16,7 +16,14 @@ function defaultConfig(): AlgorithmConfig {
     max_iterations: 6,
     target_score: 0.5,
     apply_lmat: true,
-    capture_screen_after_apply: true,
+    capture_screen_after_apply: false,
+    use_laya_editor_capture: true,
+    laya_editor_capture: {
+      reload_scene_after_reimport: true,
+      refresh_after_reimport_delay_ms: 800,
+      timeout_s: 90,
+      capture_mode: 'rotate_target',
+    },
     rerender_wait_ms: 900,
     use_capture_contract: false,
     dry_run: false,
@@ -53,7 +60,13 @@ async function load(): Promise<void> {
     const merged: AlgorithmConfig = {
       ...defaultConfig(),
       ...data.algorithm_config,
+      capture_screen_after_apply: false,
+      use_laya_editor_capture: true,
       cma_es: { ...defaultConfig().cma_es, ...(data.algorithm_config?.cma_es ?? {}) },
+      laya_editor_capture: {
+        ...defaultConfig().laya_editor_capture,
+        ...(data.algorithm_config?.laya_editor_capture ?? {}),
+      },
     };
     Object.assign(form, merged);
     error.value = null;
@@ -72,6 +85,8 @@ async function save(): Promise<void> {
   try {
     const payload: AlgorithmConfig = {
       ...form,
+      capture_screen_after_apply: false,
+      use_laya_editor_capture: true,
       cma_es: { ...form.cma_es, mode: form.optimizer === 'cma_cold' ? 'cold' : 'warm' },
     };
     const result = await patchProject(project.value.id, {
@@ -81,7 +96,13 @@ async function save(): Promise<void> {
     const merged: AlgorithmConfig = {
       ...defaultConfig(),
       ...result.algorithm_config,
+      capture_screen_after_apply: false,
+      use_laya_editor_capture: true,
       cma_es: { ...defaultConfig().cma_es, ...(result.algorithm_config?.cma_es ?? {}) },
+      laya_editor_capture: {
+        ...defaultConfig().laya_editor_capture,
+        ...(result.algorithm_config?.laya_editor_capture ?? {}),
+      },
     };
     Object.assign(form, merged);
     ok.value = true;
@@ -245,12 +266,74 @@ async function save(): Promise<void> {
             </td>
             <td class="muted small mono">{{ form.apply_lmat ? '--apply-lmat --write-candidate-lmat' : '(不写真 .lmat)' }}</td>
           </tr>
+          <tr class="legacy-disabled">
+            <td>
+              <label><input type="checkbox" :checked="false" disabled /> capture_screen_after_apply（旧屏幕截图，已禁用）</label>
+              <p class="muted small">当前自动化工具统一使用 Laya Editor 脚本截图，不再唤醒前端窗口做固定区域截图。</p>
+            </td>
+            <td class="muted small mono">(disabled)</td>
+          </tr>
           <tr>
             <td>
-              <label><input type="checkbox" v-model="form.capture_screen_after_apply" /> capture_screen_after_apply</label>
-              <p class="muted small">apply 后按截图区域抓 Laya 渲染结果（需先在项目配置里设好 region）。</p>
+              <label><input type="checkbox" :checked="true" disabled /> use_laya_editor_capture</label>
+              <p class="muted small">
+                使用 Laya Editor 扩展后台执行 reimport / reload scene / 相机截图 / 多视角 RenderTexture 截图。这是当前唯一维护的截图路径。
+              </p>
             </td>
-            <td class="muted small mono">{{ form.capture_screen_after_apply ? '--capture-screen-after-apply' : '(不截屏)' }}</td>
+            <td class="muted small mono">laya_editor_capture.enabled=true</td>
+          </tr>
+          <tr class="editor-capture-block">
+            <td colspan="2">
+              <h3 class="sub">Laya Editor 后台截图</h3>
+              <table class="cfg-subtable">
+                <tbody>
+                  <tr>
+                    <td>
+                      <label>
+                        <input type="checkbox" v-model="form.laya_editor_capture.reload_scene_after_reimport" />
+                        reload_scene_after_reimport
+                      </label>
+                      <p class="muted small">材质 reimport 后重载当前场景，确保场景实例拿到最新 .lmat。</p>
+                    </td>
+                    <td class="muted small mono">
+                      {{ form.laya_editor_capture.reload_scene_after_reimport ? 'true' : 'false' }}
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>
+                      <label for="editor-refresh-delay">refresh_after_reimport_delay_ms</label>
+                      <p class="muted small">reimport/reload 后等待多少毫秒再截图。Laya 项目大时可提高到 1200~2000。</p>
+                    </td>
+                    <td>
+                      <input
+                        id="editor-refresh-delay"
+                        type="number"
+                        min="0"
+                        max="10000"
+                        step="100"
+                        v-model.number="form.laya_editor_capture.refresh_after_reimport_delay_ms"
+                      />
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>
+                      <label for="editor-timeout">timeout_s</label>
+                      <p class="muted small">Python 等待 Laya 写出多视角 report 的最长秒数。</p>
+                    </td>
+                    <td>
+                      <input
+                        id="editor-timeout"
+                        type="number"
+                        min="5"
+                        max="600"
+                        step="5"
+                        v-model.number="form.laya_editor_capture.timeout_s"
+                      />
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </td>
           </tr>
           <tr>
             <td>
@@ -312,7 +395,8 @@ async function save(): Promise<void> {
   font-family: var(--mono);
   min-width: 240px;
 }
-.cma-block td {
+.cma-block td,
+.editor-capture-block td {
   background: rgba(255, 200, 80, 0.04);
   border-left: 3px solid var(--accent, #c79a3d);
   padding-left: 12px;

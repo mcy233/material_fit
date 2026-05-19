@@ -1,7 +1,14 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
-import { createProject, patchProject, pickFile, pickRegion } from '../api';
-import type { CaptureRegion, ProjectInputs } from '../types';
+import {
+  createProject,
+  importProjectInputFile,
+  importUnityReferenceFiles,
+  inspectLayaSceneNodes,
+  patchProject,
+  pickFile,
+} from '../api';
+import type { LayaSceneNode, LayaSceneNodesPayload, ProjectInputs } from '../types';
 
 const props = defineProps<{ open: boolean }>();
 const emit = defineEmits<{
@@ -19,23 +26,31 @@ const inputs = ref<ProjectInputs>({
   unity_shader_path: null,
   unity_material_params_path: null,
   unity_reference_image_path: null,
+  unity_reference_dir_path: null,
+  unity_reference_glob: 'unity_ref_v*_yaw*_pitch*.png',
   laya_shader_path: null,
   laya_material_lmat_path: null,
+  laya_project_path: null,
+  laya_capture_command_path: null,
+  laya_capture_camera_name: 'Capture Camera',
+  laya_capture_target_name: 'model',
   laya_capture_region: null,
   laya_capture_dir: null,
   laya_capture_state_file: null,
   laya_capture_prefix: 'laya_candidate',
 });
 
-const region = ref<CaptureRegion | null>(null);
-const pickingRegion = ref(false);
 const submitting = ref(false);
 const error = ref<string | null>(null);
+const sceneNodes = ref<LayaSceneNodesPayload | null>(null);
+const unityReferenceSourcePaths = ref<string[]>([]);
 
 const isIdValid = computed(() => /^[a-zA-Z0-9_\-]{1,64}$/.test(id.value));
 const requiredFilled = computed(
   () => !!inputs.value.laya_shader_path && !!inputs.value.laya_material_lmat_path,
 );
+
+type ImportableInputKey = 'laya_shader_path' | 'unity_shader_path' | 'unity_material_params_path';
 
 interface Slot {
   key: keyof ProjectInputs;
@@ -44,6 +59,8 @@ interface Slot {
   required: boolean;
   filetypes: [string, string][];
   image?: boolean;
+  isDir?: boolean;
+  mode: 'import_file' | 'real_path' | 'unity_refs';
 }
 
 const slots: Slot[] = [
@@ -56,6 +73,7 @@ const slots: Slot[] = [
       ['Laya shader', '*.shader *.vs *.fs'],
       ['All files', '*.*'],
     ],
+    mode: 'import_file',
   },
   {
     key: 'laya_material_lmat_path',
@@ -66,6 +84,7 @@ const slots: Slot[] = [
       ['Laya material', '*.lmat'],
       ['All files', '*.*'],
     ],
+    mode: 'real_path',
   },
   {
     key: 'unity_shader_path',
@@ -76,6 +95,7 @@ const slots: Slot[] = [
       ['Unity shader', '*.shader'],
       ['All files', '*.*'],
     ],
+    mode: 'import_file',
   },
   {
     key: 'unity_material_params_path',
@@ -86,24 +106,24 @@ const slots: Slot[] = [
       ['JSON', '*.json'],
       ['All files', '*.*'],
     ],
+    mode: 'import_file',
   },
   {
-    key: 'unity_reference_image_path',
-    label: 'Unity 渲染参考图（强烈推荐）',
-    hint: '同视角同光照下 Unity 渲染出的 PNG，是 diff 的"真值"',
+    key: 'unity_reference_dir_path',
+    label: 'Unity 多视角参考截图',
+    hint: '一次选择多张 unity_ref_v*_yaw*_pitch*.png；创建后会复制到项目 inputs/unity_references/',
     required: false,
-    image: true,
-    filetypes: [
-      ['PNG image', '*.png *.jpg *.jpeg *.bmp'],
-      ['All files', '*.*'],
-    ],
+    filetypes: [['Images', '*.png *.jpg *.jpeg *.bmp *.webp'], ['All files', '*.*']],
+    mode: 'unity_refs',
   },
   {
-    key: 'laya_capture_dir',
-    label: 'Laya 截图保存目录（可选）',
-    hint: '周期截屏会写到这里；默认是 tools/material_fit/vision/test_image',
+    key: 'laya_project_path',
+    label: 'Laya 项目目录（推荐）',
+    hint: '包含 assets/ 的 Laya 项目根目录，用于定位脚本 command 文件',
     required: false,
     filetypes: [],
+    isDir: true,
+    mode: 'real_path',
   },
 ];
 
@@ -114,9 +134,9 @@ function close(): void {
 async function pick(slot: Slot): Promise<void> {
   error.value = null;
   try {
-    const isDir = slot.key === 'laya_capture_dir';
+    const isDir = !!slot.isDir;
     const result = await pickFile({
-      mode: isDir ? 'directory' : 'open',
+      mode: slot.mode === 'unity_refs' ? 'open_many' : isDir ? 'directory' : 'open',
       title: slot.label,
       initial_dir: getInitialDir(slot.key),
       filetypes: isDir ? undefined : slot.filetypes,
@@ -125,8 +145,16 @@ async function pick(slot: Slot): Promise<void> {
       error.value = result.error;
       return;
     }
+    if (slot.mode === 'unity_refs') {
+      unityReferenceSourcePaths.value = result.paths ?? [];
+      inputs.value = { ...inputs.value, unity_reference_dir_path: null };
+      return;
+    }
     if (result.path) {
       inputs.value = { ...inputs.value, [slot.key]: result.path } as ProjectInputs;
+      if (slot.key === 'laya_project_path' || slot.key === 'laya_material_lmat_path') {
+        await loadSceneNodes();
+      }
     }
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
@@ -134,7 +162,13 @@ async function pick(slot: Slot): Promise<void> {
 }
 
 function clearSlot(key: keyof ProjectInputs): void {
+  if (key === 'unity_reference_dir_path') {
+    unityReferenceSourcePaths.value = [];
+  }
   inputs.value = { ...inputs.value, [key]: null } as ProjectInputs;
+  if (key === 'laya_project_path' || key === 'laya_material_lmat_path') {
+    void loadSceneNodes();
+  }
 }
 
 function getInitialDir(key: keyof ProjectInputs): string | undefined {
@@ -162,15 +196,32 @@ async function submit(): Promise<void> {
   submitting.value = true;
   error.value = null;
   try {
+    const projectId = id.value.trim();
     await createProject({
-      id: id.value.trim(),
-      name: name.value.trim() || id.value.trim(),
+      id: projectId,
+      name: name.value.trim() || projectId,
       description: description.value.trim(),
     });
-    await patchProject(id.value.trim(), {
-      inputs: { ...inputs.value, laya_capture_region: region.value },
+    await patchProject(projectId, {
+      inputs: {
+        laya_material_lmat_path: inputs.value.laya_material_lmat_path,
+        laya_project_path: inputs.value.laya_project_path,
+        laya_capture_camera_name: inputs.value.laya_capture_camera_name,
+        laya_capture_target_name: inputs.value.laya_capture_target_name,
+        unity_reference_glob: inputs.value.unity_reference_glob || '*.*',
+      },
     });
-    emit('created', id.value.trim());
+    await importProjectInputFile(projectId, 'laya_shader_path', inputs.value.laya_shader_path || '');
+    for (const key of ['unity_shader_path', 'unity_material_params_path'] as ImportableInputKey[]) {
+      const source = inputs.value[key];
+      if (source) {
+        await importProjectInputFile(projectId, key, source);
+      }
+    }
+    if (unityReferenceSourcePaths.value.length) {
+      await importUnityReferenceFiles(projectId, unityReferenceSourcePaths.value);
+    }
+    emit('created', projectId);
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
   } finally {
@@ -178,34 +229,45 @@ async function submit(): Promise<void> {
   }
 }
 
-async function pickRegionOnScreen(): Promise<void> {
-  pickingRegion.value = true;
-  error.value = null;
-  try {
-    const result = await pickRegion();
-    if (result.error) {
-      error.value = result.error;
-      return;
-    }
-    if (result.region) {
-      region.value = result.region;
-    }
-  } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
-  } finally {
-    pickingRegion.value = false;
-  }
-}
-
-function clearRegion(): void {
-  region.value = null;
-}
-
 function shorten(value: string | null): string {
   if (!value) return '未选择';
   if (value.length <= 80) return value;
   return value.slice(0, 30) + ' … ' + value.slice(-45);
 }
+
+function slotValue(slot: Slot): string | null {
+  if (slot.mode === 'unity_refs') {
+    return unityReferenceSourcePaths.value.length ? `已选择 ${unityReferenceSourcePaths.value.length} 张参考图` : null;
+  }
+  const value = inputs.value[slot.key];
+  return typeof value === 'string' ? value : null;
+}
+
+async function loadSceneNodes(): Promise<void> {
+  try {
+    sceneNodes.value = await inspectLayaSceneNodes(inputs.value);
+    if (!inputs.value.laya_capture_camera_name && sceneNodes.value.recommended_camera_name) {
+      inputs.value = { ...inputs.value, laya_capture_camera_name: sceneNodes.value.recommended_camera_name };
+    }
+    if (!inputs.value.laya_capture_target_name && sceneNodes.value.recommended_target_name) {
+      inputs.value = { ...inputs.value, laya_capture_target_name: sceneNodes.value.recommended_target_name };
+    }
+  } catch {
+    sceneNodes.value = null;
+  }
+}
+
+const targetOptions = computed<LayaSceneNode[]>(() => (
+  (sceneNodes.value?.nodes ?? [])
+    .filter((node) => node.name && node.type !== 'Camera')
+    .sort((a, b) => Number(b.active) - Number(a.active) || a.name.localeCompare(b.name))
+));
+
+const cameraOptions = computed<LayaSceneNode[]>(() => (
+  (sceneNodes.value?.nodes ?? [])
+    .filter((node) => node.name && node.type === 'Camera')
+    .sort((a, b) => Number(b.active) - Number(a.active) || a.name.localeCompare(b.name))
+));
 </script>
 
 <template>
@@ -236,7 +298,7 @@ function shorten(value: string | null): string {
             <textarea v-model="description" rows="2" placeholder="可选" />
           </label>
           <footer class="wizard-foot">
-            <span class="muted small">下一步：选择文件与截图区域</span>
+            <span class="muted small">下一步：选择文件与 Laya Editor command 配置</span>
             <button class="primary" :disabled="!isIdValid" @click="next">下一步</button>
           </footer>
         </section>
@@ -250,41 +312,50 @@ function shorten(value: string | null): string {
                   <span v-if="slot.required" class="required">*</span>
                 </span>
                 <div class="slot-actions">
-                  <button @click="pick(slot)">选择…</button>
-                  <button v-if="inputs[slot.key]" class="ghost" @click="clearSlot(slot.key)">清除</button>
+                  <button @click="pick(slot)">{{ slot.mode === 'real_path' ? '选择…' : '导入…' }}</button>
+                  <button v-if="slotValue(slot)" class="ghost" @click="clearSlot(slot.key)">清除</button>
                 </div>
               </div>
               <div class="slot-hint muted small">{{ slot.hint }}</div>
-              <div class="slot-value mono small" :class="{ filled: !!inputs[slot.key] }">
-                {{ shorten(typeof inputs[slot.key] === 'string' ? (inputs[slot.key] as string) : null) }}
+              <div class="slot-value mono small" :class="{ filled: !!slotValue(slot) }">
+                {{ shorten(slotValue(slot)) }}
               </div>
             </div>
           </div>
 
-          <div class="region-block">
-            <div class="slot-head">
-              <span class="slot-label">Laya 截图区域（可选）</span>
-              <div class="slot-actions">
-                <button @click="pickRegionOnScreen" :disabled="pickingRegion">
-                  {{ pickingRegion ? '请在屏幕上拖动…' : region ? '重新框选' : '在屏幕上框选…' }}
-                </button>
-                <button v-if="region" class="ghost" @click="clearRegion">清除</button>
-              </div>
-            </div>
-            <div class="region-display">
-              <template v-if="region">
-                <span class="region-pill">x <strong>{{ region.x }}</strong></span>
-                <span class="region-pill">y <strong>{{ region.y }}</strong></span>
-                <span class="region-pill">width <strong>{{ region.width }}</strong></span>
-                <span class="region-pill">height <strong>{{ region.height }}</strong></span>
-              </template>
-              <span v-else class="muted small">未框选 — 点上面的按钮，鼠标拖一个矩形即可。Esc 取消。</span>
-            </div>
-            <p class="muted small" style="margin: 6px 0 0;">
-              每轮 apply 之后会按这个矩形从主屏幕抓取 Laya 渲染窗口。如果不框选，必须在算法配置里关闭
-              <span class="kbd">capture_screen_after_apply</span>。
+          <section class="inline-config">
+            <h3>Laya 截图目标</h3>
+            <p class="muted small">
+              后续探针和正式多视角截图都会使用这两个名称。规范场景中 target_name 固定为 <span class="mono">model</span>。
             </p>
-          </div>
+            <div class="inline-grid">
+              <label class="field">
+                <span>camera_name</span>
+                <select v-if="cameraOptions.length" v-model="inputs.laya_capture_camera_name">
+                  <option
+                    v-for="node in cameraOptions"
+                    :key="node.path"
+                    :value="node.name"
+                  >{{ node.name }}{{ node.active ? '' : '（inactive）' }}</option>
+                </select>
+                <input v-model="inputs.laya_capture_camera_name" placeholder="Capture Camera" />
+              </label>
+              <label class="field">
+                <span>target_name（旋转目标）</span>
+                <select v-if="targetOptions.length" v-model="inputs.laya_capture_target_name">
+                  <option
+                    v-for="node in targetOptions"
+                    :key="node.path"
+                    :value="node.name"
+                  >{{ node.name }}{{ node.active ? '' : '（inactive）' }}</option>
+                </select>
+                <input v-model="inputs.laya_capture_target_name" placeholder="model" />
+              </label>
+            </div>
+            <p class="muted small" style="margin: 8px 0 0;">
+              场景：<span class="mono">{{ sceneNodes?.scene_path || '选择 Laya 项目目录后自动解析' }}</span>
+            </p>
+          </section>
 
           <footer class="wizard-foot">
             <button @click="step = 1">上一步</button>
@@ -347,7 +418,7 @@ function shorten(value: string | null): string {
   gap: 12px;
 }
 .field { display: flex; flex-direction: column; gap: 4px; }
-.field input, .field textarea {
+.field input, .field textarea, .field select {
   background: var(--bg-elevated);
   border: 1px solid var(--border);
   color: var(--text);
@@ -380,6 +451,15 @@ function shorten(value: string | null): string {
   color: var(--text-dim);
 }
 .slot-value.filled { color: var(--good); }
+
+.inline-config {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+}
+.inline-config h3 { margin: 0 0 4px; font-size: 13px; }
+.inline-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
 
 .region-block {
   background: var(--bg-panel);
@@ -426,6 +506,7 @@ function shorten(value: string | null): string {
 }
 .wizard-foot .primary:disabled { opacity: 0.5; }
 @media (max-width: 720px) {
-  .slot-grid { grid-template-columns: 1fr; }
+  .slot-grid,
+  .inline-grid { grid-template-columns: 1fr; }
 }
 </style>

@@ -174,10 +174,11 @@ def run_preanalysis(
 def get_preanalysis(project_id: str, config: LoaderConfig | None = None) -> dict[str, Any] | None:
     config = config or LoaderConfig()
     paths = project_paths(project_id, config)
-    if not paths.preanalysis_json.exists():
+    preanalysis_path = paths.preanalysis_json if paths.preanalysis_json.exists() else paths.project_dir / "preanalysis.json"
+    if not preanalysis_path.exists():
         return None
     try:
-        return json.loads(paths.preanalysis_json.read_text(encoding="utf-8-sig"))
+        return json.loads(preanalysis_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -1127,6 +1128,7 @@ def _refresh_laya_control_schema_payload(
     payload["laya_control_groups"] = _schema_to_control_groups(effective)
 
     paths = project_paths(project_id, config)
+    paths.preanalysis_json.parent.mkdir(parents=True, exist_ok=True)
     paths.preanalysis_json.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -2156,10 +2158,10 @@ def _collect_warnings(
             warnings.append(
                 f"{unity_only} 个 Unity 属性没有自动找到 Laya 对应——可在表格里手动配对，或添加到 curated 字典。"
             )
-    if not inputs.get("unity_reference_image_path"):
-        warnings.append("没有 Unity 参考图，自动调参无法进行图像差异分析；至少需要一张参考图。")
-    if not inputs.get("laya_capture_region"):
-        warnings.append("Laya 截图区域未配置；勾选 capture_screen_after_apply 时必须提供。")
+    if not (inputs.get("unity_reference_dir_path") or inputs.get("unity_reference_image_path")):
+        warnings.append("没有 Unity 参考图或多视角参考目录，自动调参无法进行图像差异分析。")
+    if not (inputs.get("laya_project_path") or inputs.get("laya_capture_command_path")):
+        warnings.append("没有 Laya 项目目录或 command JSON，后台脚本截图无法触发。")
     if not inputs.get("laya_material_lmat_path"):
         warnings.append("没有 Laya .lmat 写入目标，自动调参无法应用材质修改。")
     return warnings

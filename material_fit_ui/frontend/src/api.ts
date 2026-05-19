@@ -2,10 +2,13 @@ import type {
   CaseOverviewPayload,
   CaseSummary,
   FileInfo,
+  FileListResult,
   FilePickResult,
   IterationDetail,
   IterationSummary,
   JobState,
+  LayaProbeOptions,
+  LayaSceneNodesPayload,
   LayaControlSchemaPresetList,
   PreanalysisPayload,
   PreflightResult,
@@ -64,6 +67,16 @@ export function fetchProject(projectId: string): Promise<ProjectDetail> {
   return getJson<ProjectDetail>(`/api/projects/${encodeURIComponent(projectId)}`);
 }
 
+export function fetchLayaSceneNodes(projectId: string): Promise<LayaSceneNodesPayload> {
+  return getJson<LayaSceneNodesPayload>(
+    `/api/projects/${encodeURIComponent(projectId)}/laya_scene_nodes`,
+  );
+}
+
+export function inspectLayaSceneNodes(inputs: Partial<ProjectDetail['inputs']>): Promise<LayaSceneNodesPayload> {
+  return sendJson<LayaSceneNodesPayload>('/api/laya_scene_nodes/inspect', 'POST', { inputs });
+}
+
 export function patchProject(
   projectId: string,
   patch: Record<string, unknown>,
@@ -82,12 +95,35 @@ export function deleteProject(projectId: string): Promise<{ id: string; trash_pa
   );
 }
 
+export function importProjectInputFile(
+  projectId: string,
+  inputKey: 'laya_shader_path' | 'unity_shader_path' | 'unity_material_params_path',
+  sourcePath: string,
+): Promise<ProjectDetail> {
+  return sendJson<ProjectDetail>(
+    `/api/projects/${encodeURIComponent(projectId)}/inputs/import_file`,
+    'POST',
+    { input_key: inputKey, source_path: sourcePath },
+  );
+}
+
+export function importUnityReferenceFiles(
+  projectId: string,
+  sourcePaths: string[],
+): Promise<ProjectDetail> {
+  return sendJson<ProjectDetail>(
+    `/api/projects/${encodeURIComponent(projectId)}/inputs/import_unity_references`,
+    'POST',
+    { source_paths: sourcePaths },
+  );
+}
+
 // ============================================================================
 // File picker (native dialog) + filesystem peek
 // ============================================================================
 
 export function pickFile(payload: {
-  mode?: 'open' | 'save' | 'directory';
+  mode?: 'open' | 'open_many' | 'save' | 'directory';
   title?: string;
   initial_dir?: string;
   initial_file?: string;
@@ -96,29 +132,20 @@ export function pickFile(payload: {
   return sendJson<FilePickResult>('/api/files/pick', 'POST', payload);
 }
 
-export interface RegionPickResult {
-  region: { x: number; y: number; width: number; height: number } | null;
-  error?: string;
-  // E-008 follow-up: when pickRegion is called with a laya_window
-  // descriptor, the backend also returns the Laya window's current
-  // rect (so the frontend can save it for diagnostic purposes) and
-  // a precomputed anchor (region position relative to the Laya
-  // window's top-left). The frontend is expected to write the anchor
-  // back into project.inputs.laya_capture_anchor so future captures
-  // survive Laya window drags/resizes.
-  laya_window_rect?: { left: number; top: number; right: number; bottom: number } | null;
-  anchor?: { offset_x: number; offset_y: number; width: number; height: number } | null;
-  anchor_error?: string;
-}
-
-export function pickRegion(payload?: {
-  laya_window?: { process_pattern?: string; title_pattern?: string };
-}): Promise<RegionPickResult> {
-  return sendJson<RegionPickResult>('/api/files/pick_region', 'POST', payload ?? {});
-}
-
 export function fileInfo(path: string): Promise<FileInfo> {
   return getJson<FileInfo>(`/api/files/info?path=${encodeURIComponent(path)}`);
+}
+
+export function listFiles(path: string, pattern = '*', limit = 64): Promise<FileListResult> {
+  return getJson<FileListResult>(
+    `/api/files/list?path=${encodeURIComponent(path)}&pattern=${encodeURIComponent(pattern)}&limit=${limit}`,
+  );
+}
+
+export function unityReferenceFiles(path = '', pattern = 'unity_ref_v*_yaw*_pitch*.png', limit = 32): Promise<FileListResult> {
+  return getJson<FileListResult>(
+    `/api/files/unity_references?path=${encodeURIComponent(path)}&pattern=${encodeURIComponent(pattern)}&limit=${limit}`,
+  );
 }
 
 export function externalPreviewUrl(path: string): string {
@@ -162,6 +189,12 @@ export function runLayaRefreshPreflight(
     `/api/projects/${encodeURIComponent(projectId)}/preflight/laya_refresh`,
     'POST',
     options,
+  );
+}
+
+export function fetchLayaProbeOptions(projectId: string): Promise<LayaProbeOptions> {
+  return getJson<LayaProbeOptions>(
+    `/api/projects/${encodeURIComponent(projectId)}/preflight/laya_probe_options`,
   );
 }
 

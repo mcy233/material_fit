@@ -102,10 +102,13 @@ export interface ParamChange {
 export interface IterationDecision {
   iteration?: number;
   input_pair?: { reference?: string; candidate?: string; mask?: string };
+  input_pairs?: Array<{ reference?: string; candidate?: string; mask?: string; view_id?: string }>;
   diff_score_before?: number;
   fit_score_before?: number;
   target_score?: number;
   selected_stage?: string;
+  multiview_analysis?: MultiviewAnalysis;
+  perceptual_signals?: Record<string, unknown>;
   decision?: {
     stage?: AdjustmentPolicy;
     iteration_gain?: number;
@@ -119,6 +122,67 @@ export interface IterationDecision {
   candidate_lmat_path?: string;
   render_result?: Record<string, unknown>;
   screen_capture_after_apply?: Record<string, unknown> | null;
+}
+
+export interface IterationMultiviewImage {
+  pair_index?: number;
+  view_id: string;
+  reference: string | null;
+  candidate: string | null;
+  diff: string | null;
+  fit_score?: number | null;
+  diff_score?: number | null;
+  research_score?: number | null;
+  research_loss?: number | null;
+  research_valid?: boolean | null;
+  analysis_path?: string | null;
+}
+
+export interface MultiviewAnalysisView {
+  pair_index: number;
+  view_id: string;
+  reference?: string;
+  candidate?: string;
+  mask?: string;
+  analysis_dir?: string;
+  analysis_path?: string;
+  diff_image_path?: string;
+  diff_score?: number | null;
+  fit_score?: number | null;
+  perceptual_fit_score?: number | null;
+  human_accept_score?: number | null;
+  research_score?: number | null;
+  research_loss?: number | null;
+  research_valid?: boolean | null;
+  research_metrics?: Record<string, unknown> | null;
+  status?: string;
+}
+
+export interface MultiviewAnalysisSummary {
+  mean_diff_score?: number | null;
+  mean_fit_score?: number | null;
+  min_fit_score?: number | null;
+  max_fit_score?: number | null;
+  p10_fit_score?: number | null;
+  p90_loss?: number | null;
+  worst_view_id?: string | null;
+  worst_fit_score?: number | null;
+  research_score?: number | null;
+  research_loss?: number | null;
+  research_valid_view_count?: number | null;
+  research_invalid_view_count?: number | null;
+}
+
+export interface MultiviewAnalysis {
+  version?: number;
+  status?: string;
+  aggregation?: Record<string, string>;
+  pair_count?: number;
+  ok_count?: number;
+  diff_scores?: number[];
+  fit_scores?: number[];
+  views?: MultiviewAnalysisView[];
+  summary?: MultiviewAnalysisSummary;
 }
 
 export interface MaterialChannel {
@@ -166,6 +230,7 @@ export interface DiffAnalysis {
   human_accept_score?: number;
   human_accept?: Record<string, unknown>;
   perceptual?: Record<string, unknown>;
+  research_metrics?: Record<string, unknown>;
   report_path?: string;
 }
 
@@ -183,6 +248,7 @@ export interface IterationDetail {
     candidate: string | null;
     diff: string | null;
   };
+  multiview_images?: IterationMultiviewImage[];
   _note?: string;
 }
 
@@ -259,14 +325,35 @@ export interface ProjectInputs {
   unity_shader_path: string | null;
   unity_material_params_path: string | null;
   unity_reference_image_path: string | null;
+  unity_reference_dir_path: string | null;
+  unity_reference_glob: string;
   laya_shader_path: string | null;
   laya_material_lmat_path: string | null;
+  laya_project_path: string | null;
+  laya_capture_command_path: string | null;
+  laya_capture_camera_name: string | null;
+  laya_capture_target_name: string | null;
   laya_capture_region: CaptureRegion | null;
   laya_capture_dir: string | null;
   laya_capture_state_file: string | null;
   laya_capture_prefix: string;
   laya_window?: LayaWindowConfig;
   laya_capture_anchor?: LayaCaptureAnchor;
+}
+
+export interface LayaSceneNode {
+  name: string;
+  type: string;
+  active: boolean;
+  path: string;
+  prefab: string;
+}
+
+export interface LayaSceneNodesPayload {
+  scene_path: string;
+  nodes: LayaSceneNode[];
+  recommended_target_name: string;
+  recommended_camera_name: string;
 }
 
 export type FitScoreMode = 'linear' | 'perceptual' | 'human_accept';
@@ -290,6 +377,7 @@ export interface PreflightResult {
   detected_change: boolean;
   detected_restore: boolean;
   reason: string;
+  capture_method?: 'laya_editor_selected_camera' | 'laya_editor_single_view' | 'legacy_screen_region';
   // Primary signals (added in E-007 follow-up): mean per-pixel L1 color
   // distance, in [0, 255]. Robust on textured surfaces where the legacy
   // magenta_ratio detector under-reports.
@@ -311,6 +399,21 @@ export interface PreflightResult {
   notes: string[];
   error: string | null;
   last_path?: string;
+  probe_options?: LayaProbeOptions;
+}
+
+export interface LayaProbeOption {
+  name: string;
+  param_type: string;
+  current_value: unknown;
+  recommended: boolean;
+}
+
+export interface LayaProbeOptions {
+  recommended: string | null;
+  options: LayaProbeOption[];
+  laya_shader_path: string;
+  laya_material_lmat_path: string;
 }
 
 export interface LayaRefreshProbeConfig {
@@ -342,15 +445,34 @@ export interface LayaControlGroupOverride {
   enabled: boolean;
 }
 
+export interface LayaEditorCaptureConfig {
+  reload_scene_after_reimport: boolean;
+  refresh_after_reimport_delay_ms: number;
+  timeout_s: number;
+  capture_mode?: 'orbit_camera' | 'rotate_target' | 'auto';
+}
+
+export interface MultiviewScoringConfig {
+  enabled: boolean;
+  require_all_views: boolean;
+  fit_aggregation: string;
+  diff_aggregation: string;
+  channel_aggregation: string;
+  primary_view_id: string;
+}
+
 export interface AlgorithmConfig {
   max_iterations: number;
   target_score: number;
   apply_lmat: boolean;
   capture_screen_after_apply: boolean;
+  use_laya_editor_capture: boolean;
+  laya_editor_capture: LayaEditorCaptureConfig;
   rerender_wait_ms: number;
   use_capture_contract: boolean;
   dry_run: boolean;
   fit_score_mode: FitScoreMode;
+  multiview_scoring?: MultiviewScoringConfig;
   auto_adjust_mode?: AutoAdjustMode;
   laya_refresh_probe?: LayaRefreshProbeConfig;
   optimizer: OptimizerKind;
@@ -683,6 +805,7 @@ export interface JobState {
 
 export interface FilePickResult {
   path: string;
+  paths?: string[];
   error?: string;
 }
 
@@ -696,4 +819,10 @@ export interface FileInfo {
   name?: string;
   suffix?: string;
   error?: string;
+}
+
+export interface FileListResult {
+  path: string;
+  exists: boolean;
+  files: FileInfo[];
 }

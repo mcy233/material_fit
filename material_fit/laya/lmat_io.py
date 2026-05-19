@@ -57,9 +57,14 @@ def save_lmat(data: dict[str, Any], path: str | Path) -> None:
         fh.write(payload)
 
 
-def backup_lmat(path: str | Path, suffix: str = ".bak") -> Path:
+def backup_lmat(path: str | Path, suffix: str = ".bak", target_dir: str | Path | None = None) -> Path:
     source = Path(path)
-    target = source.with_name(source.name + suffix)
+    if target_dir is None:
+        target = source.with_name(source.name + suffix)
+    else:
+        destination_dir = Path(target_dir)
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        target = destination_dir / f"{source.name}{suffix}"
     shutil.copy2(source, target)
     return target
 

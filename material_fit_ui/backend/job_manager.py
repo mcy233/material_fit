@@ -2,11 +2,11 @@
 
 Each job:
 
-- writes ``fit_config.json`` from the project's current state;
+- creates ``jobs/<job_id>/runs/<date-settings>/`` and writes that run's ``fit_config.json``;
 - spawns ``python -m tools.material_fit.fit_material --config <path> ...``;
-- captures stdout/stderr to ``jobs/<job_id>.log``;
-- maintains ``jobs/<job_id>.json`` with status, observed iterations, etc.;
-- a watcher thread tails ``auto_adjust/iter_*/decision.json`` so the UI can
+- captures stdout/stderr to ``jobs/<job_id>/job.log``;
+- maintains ``jobs/<job_id>/job.json`` with status, observed iterations, etc.;
+- a watcher thread tails ``jobs/<job_id>/runs/<run_id>/auto_adjust/iter_*/decision.json`` so the UI can
   poll the project's iteration list and immediately see the latest decision
   without waiting for the whole run to finish.
 
@@ -36,7 +36,6 @@ from .project_store import (
     get_project,
     patch_project,
     project_paths,
-    write_fit_config,
 )
 
 
@@ -55,6 +54,8 @@ class Job:
     return_code: int | None = None
     error: str | None = None
     args: list[str] = field(default_factory=list)
+    run_id: str | None = None
+    run_dir: str | None = None
     iterations_observed: int = 0
     last_iter_id: str | None = None
     last_decision_summary: dict[str, Any] | None = None
@@ -70,6 +71,8 @@ class Job:
             "return_code": self.return_code,
             "error": self.error,
             "args": list(self.args),
+            "run_id": self.run_id,
+            "run_dir": self.run_dir,
             "iterations_observed": self.iterations_observed,
             "last_iter_id": self.last_iter_id,
             "last_decision_summary": self.last_decision_summary,
@@ -93,11 +96,12 @@ def start_job(
         if existing and existing.get("status") == "running":
             raise RuntimeError(f"project {project_id} already has running job {existing['job_id']}")
 
-    _clear_previous_iteration_outputs(paths.project_dir)
-    fit_config_path = write_fit_config(project_id, config)
     fit_config = derive_fit_config(project_id, config)
-
     algo = project.get("algorithm_config", {})
+    editor_capture_enabled = bool(
+        isinstance(fit_config.get("laya_editor_capture"), dict)
+        and fit_config["laya_editor_capture"].get("enabled")
+    )
     # E-010: per-optimizer iteration budget. Heuristic was designed
     # around 6 iterations (one per stage); CMA-ES needs many more
     # generations to converge on a 49-dim space (literature: 100+
@@ -110,6 +114,37 @@ def start_job(
         default_iterations = 12
     else:
         default_iterations = 6
+    job_id = _new_job_id()
+    run_id = _new_run_id(algo)
+    job_dir = paths.jobs_dir / job_id
+    run_dir = job_dir / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
+    fit_config = _fit_config_for_run(fit_config, run_dir)
+    fit_config["project_preflight_dir"] = str((paths.project_dir / "preflight").resolve())
+    refresh_cert = _valid_refresh_session_cert(paths, fit_config)
+    if refresh_cert:
+        fit_config["laya_refresh_session_cert"] = refresh_cert
+    fit_config_path = run_dir / "fit_config.json"
+    fit_config_path.write_text(
+        json.dumps(fit_config, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    job_dir.joinpath("job_config.json").write_text(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "project_id": project_id,
+                "run_id": run_id,
+                "run_dir": str(run_dir),
+                "fit_config_path": str(fit_config_path),
+                "algorithm_config": algo,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
     args = [
         sys.executable,
         "-m",
@@ -125,23 +160,23 @@ def start_job(
     if algo.get("apply_lmat", True):
         args.append("--apply-lmat")
         args.append("--write-candidate-lmat")
-    if algo.get("capture_screen_after_apply", True):
+    if (not editor_capture_enabled) and algo.get("capture_screen_after_apply", False):
         args.append("--capture-screen-after-apply")
     if algo.get("dry_run", False):
         args.append("--dry-run")
-    if algo.get("use_capture_contract", False):
+    if (not editor_capture_enabled) and algo.get("use_capture_contract", False):
         args.append("--capture")
     fit_score_mode = str(algo.get("fit_score_mode", "linear")).lower()
     if fit_score_mode in ("linear", "perceptual"):
         args.extend(["--fit-score-mode", fit_score_mode])
     region = fit_config.get("screen_capture", {}).get("region")
-    if region:
+    if (not editor_capture_enabled) and region:
         args.extend(["--screen-capture-region", region])
     # E-012: rolling capture pool size. Only emit the flag when the
     # project explicitly set max_keep to a non-default value, so the
     # CLI's own default (30) takes over otherwise.
     max_keep = fit_config.get("screen_capture", {}).get("max_keep")
-    if max_keep not in (None, ""):
+    if (not editor_capture_enabled) and max_keep not in (None, ""):
         try:
             args.extend(["--screen-capture-max-keep", str(int(max_keep))])
         except (TypeError, ValueError):
@@ -170,16 +205,13 @@ def start_job(
     if cma_es.get("hint_bias_mix_ratio") not in (None, ""):
         args.extend(["--cma-hint-bias-mix-ratio", str(float(cma_es["hint_bias_mix_ratio"]))])
 
-    # E-007: also turn on the magenta-probe preflight by default, and
-    # carry through the project's laya_window block so the focus
-    # callback is identical between the UI's standalone preflight and
-    # the auto-adjust subprocess. Set algorithm_config.laya_refresh_check
-    # to false to suppress the preflight (the focus block is always passed
-    # via fit_config.json regardless).
-    if algo.get("laya_refresh_check", True) and algo.get("apply_lmat", True):
-        args.append("--laya-refresh-check")
+    # The Laya refresh probe belongs to the project preflight flow, not the
+    # formal auto-adjust loop. Running it here writes a temporary probe value
+    # into the .lmat before the first iteration and can contaminate the user's
+    # intended initial state. Keep the CLI flag available for manual debugging,
+    # but do not append it from UI jobs.
     laya_window = fit_config.get("laya_window") or {}
-    if isinstance(laya_window, dict):
+    if (not editor_capture_enabled) and isinstance(laya_window, dict):
         process_pat = str(laya_window.get("process_pattern", ""))
         title_pat = str(laya_window.get("title_pattern", ""))
         args.extend(["--laya-window-process", process_pat])
@@ -192,9 +224,8 @@ def start_job(
                 args.append(arg)
 
     paths.jobs_dir.mkdir(parents=True, exist_ok=True)
-    job_id = _new_job_id()
-    log_path = paths.jobs_dir / f"{job_id}.log"
-    state_path = paths.jobs_dir / f"{job_id}.json"
+    log_path = job_dir / "job.log"
+    state_path = job_dir / "job.json"
 
     job = Job(
         job_id=job_id,
@@ -202,6 +233,8 @@ def start_job(
         status="running",
         started_at=_now_iso(),
         args=args,
+        run_id=run_id,
+        run_dir=str(run_dir),
     )
 
     log_handle = log_path.open("w", encoding="utf-8")
@@ -219,13 +252,18 @@ def start_job(
         _JOB_REGISTRY[job_id] = job
     patch_project(
         project_id,
-        {"active_job_id": job_id, "last_job_id": job_id},
+        {
+            "active_job_id": job_id,
+            "last_job_id": job_id,
+            "active_run_id": run_id,
+            "last_run_id": run_id,
+        },
         config=config,
     )
 
     watcher = threading.Thread(
         target=_watch_job,
-        args=(job, proc, log_handle, paths.project_dir, state_path, config),
+        args=(job, proc, log_handle, run_dir, state_path, config),
         name=f"fit-job-{job_id}",
         daemon=True,
     )
@@ -264,9 +302,12 @@ def list_jobs(project_id: str, config: LoaderConfig | None = None) -> list[dict[
         return []
     out: list[dict[str, Any]] = []
     for entry in sorted(paths.jobs_dir.iterdir(), key=lambda path: path.name.lower(), reverse=True):
-        if entry.suffix.lower() != ".json":
+        if entry.is_dir():
+            data = _load_job_dict(entry.name, paths.jobs_dir)
+        elif entry.suffix.lower() == ".json":
+            data = _load_job_dict(entry.stem, paths.jobs_dir)
+        else:
             continue
-        data = _load_job_dict(entry.stem, paths.jobs_dir)
         if data:
             out.append(data)
     return out
@@ -282,8 +323,9 @@ def get_job(job_id: str, config: LoaderConfig | None = None) -> dict[str, Any]:
     for project_dir in config.output_dir.iterdir() if config.output_dir.exists() else []:
         if not project_dir.is_dir():
             continue
-        candidate = project_dir / "jobs" / f"{job_id}.json"
-        if candidate.exists():
+        candidate = project_dir / "jobs" / job_id / "job.json"
+        legacy_candidate = project_dir / "jobs" / f"{job_id}.json"
+        if candidate.exists() or legacy_candidate.exists():
             data = _load_job_dict(job_id, project_dir / "jobs")
             if data:
                 return data
@@ -315,7 +357,9 @@ def get_job_log(job_id: str, config: LoaderConfig | None = None, *, tail_kb: int
     for project_dir in config.output_dir.iterdir() if config.output_dir.exists() else []:
         if not project_dir.is_dir():
             continue
-        log_path = project_dir / "jobs" / f"{job_id}.log"
+        log_path = project_dir / "jobs" / job_id / "job.log"
+        if not log_path.exists():
+            log_path = project_dir / "jobs" / f"{job_id}.log"
         if log_path.exists():
             try:
                 size = log_path.stat().st_size
@@ -375,10 +419,16 @@ def _watch_job(
         except Exception:
             pass
         _save_job(job, state_path)
+        _save_job_result(job, state_path.parent)
         try:
             patch_project(
                 job.project_id,
-                {"active_job_id": None, "last_job_id": job.job_id},
+                {
+                    "active_job_id": None,
+                    "last_job_id": job.job_id,
+                    "active_run_id": None,
+                    "last_run_id": job.run_id,
+                },
                 config=config,
             )
         except Exception:  # noqa: BLE001
@@ -432,13 +482,39 @@ def _save_job(job: Job, state_path: Path) -> None:
     state_path.write_text(json.dumps(job.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _save_job_result(job: Job, job_dir: Path) -> None:
+    payload = {
+        "job_id": job.job_id,
+        "project_id": job.project_id,
+        "status": job.status,
+        "return_code": job.return_code,
+        "error": job.error,
+        "started_at": job.started_at,
+        "ended_at": job.ended_at,
+        "run_id": job.run_id,
+        "run_dir": job.run_dir,
+        "iterations_observed": job.iterations_observed,
+        "last_iter_id": job.last_iter_id,
+        "last_decision_summary": job.last_decision_summary,
+    }
+    try:
+        (job_dir / "job_result.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
 def _state_path_for(job: Job, config: LoaderConfig) -> Path:
     paths = project_paths(job.project_id, config)
-    return paths.jobs_dir / f"{job.job_id}.json"
+    return paths.jobs_dir / job.job_id / "job.json"
 
 
 def _load_job_dict(job_id: str, jobs_dir: Path) -> dict[str, Any] | None:
-    path = jobs_dir / f"{job_id}.json"
+    path = jobs_dir / job_id / "job.json"
+    if not path.exists():
+        path = jobs_dir / f"{job_id}.json"
     if not path.exists():
         return None
     try:
@@ -451,6 +527,68 @@ def _load_job_dict(job_id: str, jobs_dir: Path) -> dict[str, Any] | None:
 def _new_job_id() -> str:
     stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
     return f"job_{stamp}_{secrets.token_hex(3)}"
+
+
+def _new_run_id(algo: dict[str, Any]) -> str:
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    optimizer = _slug(str(algo.get("optimizer", "optimizer")))
+    score_mode = _slug(str(algo.get("fit_score_mode", "score")))
+    adjust_mode = _slug(str(algo.get("auto_adjust_mode", "mode")))
+    return f"{stamp}-{optimizer}-{score_mode}-{adjust_mode}-{secrets.token_hex(2)}"
+
+
+def _slug(value: str) -> str:
+    safe = []
+    for ch in value.strip().lower():
+        if ch.isalnum():
+            safe.append(ch)
+        elif ch in {"_", "-"}:
+            safe.append("-")
+    slug = "".join(safe).strip("-")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug or "default"
+
+
+def _fit_config_for_run(fit_config: dict[str, Any], run_dir: Path) -> dict[str, Any]:
+    payload = dict(fit_config)
+    payload["output_dir"] = str(run_dir.resolve())
+    payload["external_backup_dir"] = str((run_dir / "external_backups").resolve())
+    screen_capture = dict(payload.get("screen_capture") or {})
+    capture_dir = run_dir / "captures"
+    screen_capture["capture_dir"] = str(capture_dir.resolve())
+    screen_capture["state_file"] = str((capture_dir / ".capture_region.json").resolve())
+    # Each run has its own capture directory, so keep every capture from
+    # that run instead of pruning a shared rolling pool.
+    screen_capture["max_keep"] = 0
+    payload["screen_capture"] = screen_capture
+    return payload
+
+
+def _valid_refresh_session_cert(paths: Any, fit_config: dict[str, Any]) -> dict[str, Any] | None:
+    cert_path = paths.project_dir / "preflight" / "refresh_session_cert.json"
+    if not cert_path.exists():
+        return None
+    try:
+        cert = json.loads(cert_path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(cert, dict) or not cert.get("success"):
+        return None
+    editor_capture = fit_config.get("laya_editor_capture") if isinstance(fit_config.get("laya_editor_capture"), dict) else {}
+    lmat_path = str(Path(str(fit_config.get("laya_material_path") or "")).resolve())
+    if str(cert.get("lmat_path") or "") != lmat_path:
+        return None
+    for key in ("laya_project", "command_path"):
+        expected = str(editor_capture.get(key) or "")
+        if expected and str(cert.get(key) or "") != expected:
+            return None
+    refresh_assets = editor_capture.get("refresh_assets") if isinstance(editor_capture.get("refresh_assets"), list) else []
+    if [str(item) for item in refresh_assets] != [str(item) for item in cert.get("refresh_assets", [])]:
+        return None
+    if cert.get("reload_scene_after_reimport") is not False or cert.get("reimport_only") is not True:
+        return None
+    return {**cert, "path": str(cert_path.resolve())}
 
 
 def _now_iso() -> str:

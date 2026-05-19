@@ -3,16 +3,22 @@ import { computed, onMounted, ref, watch } from 'vue';
 import {
   externalPreviewUrl,
   fetchLastLayaRefreshPreflight,
+  fetchLayaProbeOptions,
   runLayaRefreshPreflight,
 } from '../api';
-import type { PreflightResult } from '../types';
+import type { LayaProbeOptions, PreflightResult } from '../types';
 
-const props = defineProps<{ projectId: string; lmatPath: string | null; regionFilled: boolean }>();
+const props = defineProps<{
+  projectId: string;
+  lmatPath: string | null;
+  editorCaptureEnabled: boolean;
+}>();
 
 const result = ref<PreflightResult | null>(null);
 const running = ref(false);
 const error = ref<string | null>(null);
 const probeParam = ref('u_BaseColor');
+const probeOptions = ref<LayaProbeOptions | null>(null);
 const changeThreshold = ref('');
 const restoreThreshold = ref('');
 // Probe writes to fixed paths (preflight/{baseline,probe,restored}.png),
@@ -22,7 +28,11 @@ const restoreThreshold = ref('');
 // changing the URL query string.
 const cacheBust = ref(Date.now());
 
-const canRun = computed(() => !running.value && !!props.lmatPath && props.regionFilled);
+const canRun = computed(() => (
+  !running.value
+  && !!props.lmatPath
+  && props.editorCaptureEnabled
+));
 
 function bustedSrc(path: string | null | undefined): string {
   if (!path) return '';
@@ -35,12 +45,29 @@ function bustedSrc(path: string | null | undefined): string {
 async function load(): Promise<void> {
   if (!props.projectId) return;
   try {
-    result.value = await fetchLastLayaRefreshPreflight(props.projectId);
-    syncThresholdInputs(result.value);
+    await loadProbeOptions();
+    const last = await fetchLastLayaRefreshPreflight(props.projectId);
+    result.value = last;
+    if (last?.probe_param && optionNames.value.has(last.probe_param)) {
+      probeParam.value = last.probe_param;
+    }
+    syncThresholdInputs(activeResult.value);
     cacheBust.value = Date.now();
     error.value = null;
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
+  }
+}
+
+async function loadProbeOptions(): Promise<void> {
+  try {
+    const options = await fetchLayaProbeOptions(props.projectId);
+    probeOptions.value = options;
+    if (options.recommended && (!probeParam.value || probeParam.value === 'u_BaseColor' || !optionNames.value.has(probeParam.value))) {
+      probeParam.value = options.recommended;
+    }
+  } catch {
+    probeOptions.value = null;
   }
 }
 
@@ -56,7 +83,7 @@ async function run(): Promise<void> {
       ...(change == null ? {} : { mean_diff_change_threshold: change }),
       ...(restore == null ? {} : { mean_diff_restore_threshold: restore }),
     });
-    syncThresholdInputs(result.value);
+    syncThresholdInputs(activeResult.value);
     cacheBust.value = Date.now();
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
@@ -95,12 +122,20 @@ function syncThresholdInputs(next: PreflightResult | null): void {
   }
 }
 
-const anyFocusFailed = computed(
-  () => Boolean(result.value?.focus_log?.some((e) => !e.success)),
-);
+const optionNames = computed(() => new Set((probeOptions.value?.options ?? []).map((item) => item.name)));
+const recommendedProbeParam = computed(() => probeOptions.value?.recommended ?? '');
+
+const staleLegacyResult = computed(() => (
+  props.editorCaptureEnabled
+  && !!result.value
+  && result.value.capture_method !== 'laya_editor_selected_camera'
+  && result.value.capture_method !== 'laya_editor_single_view'
+));
+
+const activeResult = computed(() => (staleLegacyResult.value ? null : result.value));
 
 const diffOverChange = computed(() => {
-  const r = result.value;
+  const r = activeResult.value;
   if (!r) return false;
   const v = r.mean_diff_baseline_probe;
   const t = r.mean_diff_change_threshold;
@@ -108,7 +143,7 @@ const diffOverChange = computed(() => {
 });
 
 const diffUnderRestore = computed(() => {
-  const r = result.value;
+  const r = activeResult.value;
   if (!r) return false;
   const v = r.mean_diff_baseline_restored;
   const t = r.mean_diff_restore_threshold;
@@ -123,13 +158,29 @@ const diffUnderRestore = computed(() => {
         <h3 class="section-title" style="margin: 0 0 4px;">验证 Laya 是否真的在刷新（推荐先点这个）</h3>
         <p class="muted small" style="margin: 0;">
           往 <span class="mono">{{ probeParam || 'u_BaseColor' }}</span> 写一个洋红色（{{ '[1, 0, 1, 1]' }}），等
-          rerender_wait_ms 后截屏，再还原 .lmat 后再截屏。
+          rerender_wait_ms 后截图，再还原 .lmat 后再截图。
+          当前使用 <strong>Laya Editor 相机截图</strong>，探针直接调用 <span class="mono">Capture Camera</span> 当前参数截单张，不会混入正式多视角评分截图。
           下面用 <strong>逐像素平均色差</strong>判定：probe 跟 baseline 显著不同 + restored 又回到 baseline 附近 = 通过。
           这个判定对各种贴图材质都鲁棒，不依赖"显著变红"。
         </p>
       </div>
       <div class="ph-controls">
         <input v-model="probeParam" class="probe-input" placeholder="u_BaseColor" :disabled="running" />
+        <select
+          v-if="probeOptions?.options?.length"
+          v-model="probeParam"
+          class="probe-input probe-select"
+          :disabled="running"
+          title="从当前 .lmat / Laya shader 中检测到的 Color 参数"
+        >
+          <option
+            v-for="option in probeOptions.options"
+            :key="option.name"
+            :value="option.name"
+          >
+            {{ option.name }}{{ option.recommended ? '（推荐）' : '' }}
+          </option>
+        </select>
         <input
           v-model="changeThreshold"
           class="probe-input threshold-input"
@@ -157,15 +208,20 @@ const diffUnderRestore = computed(() => {
     </header>
 
     <p v-if="!props.lmatPath" class="muted small">先在上面的"输入文件"里选好 Laya .lmat 才能跑探针。</p>
-    <p v-else-if="!props.regionFilled" class="muted small">先在"Laya 截图区域"里框选好截图矩形才能跑探针。</p>
+    <p v-else-if="recommendedProbeParam" class="muted small">
+      当前推荐探针参数：<span class="mono">{{ recommendedProbeParam }}</span>。该参数来自当前 Laya shader / .lmat 中实际存在的 Color 参数。
+    </p>
+    <p v-if="staleLegacyResult" class="error-banner">
+      当前保存的探针结果是旧的屏幕截图缓存，已经不适用于后台 Laya Editor 截图流程。请重新点击“运行 Laya 刷新探针”，页面会只保留 Capture Camera 相机脚本截图结果。
+    </p>
     <p v-if="error" class="error-banner">{{ error }}</p>
 
-    <div v-if="result" class="ph-body">
-      <div class="ph-status" :class="{ ok: result.success, bad: !result.success }">
-        <span class="ph-status-icon">{{ result.success ? '✓' : '✗' }}</span>
-        <span class="ph-status-text">{{ result.success ? '通过：Laya 在 .lmat 写入后真的刷新了' : '未通过：' + result.reason }}</span>
+    <div v-if="activeResult" class="ph-body">
+      <div class="ph-status" :class="{ ok: activeResult.success, bad: !activeResult.success }">
+        <span class="ph-status-icon">{{ activeResult.success ? '✓' : '✗' }}</span>
+        <span class="ph-status-text">{{ activeResult.success ? '通过：Laya 在 .lmat 写入后真的刷新了' : '未通过：' + activeResult.reason }}</span>
       </div>
-      <div v-if="result.success" class="muted small" style="margin-top: 4px;">{{ result.reason }}</div>
+      <div v-if="activeResult.success" class="muted small" style="margin-top: 4px;">{{ activeResult.reason }}</div>
 
       <table class="ph-table">
         <thead>
@@ -178,15 +234,15 @@ const diffUnderRestore = computed(() => {
         <tbody>
           <tr class="ph-imgrow">
             <td>
-              <img v-if="result.captures.baseline" :src="bustedSrc(result.captures.baseline)" alt="baseline capture" />
+              <img v-if="activeResult.captures.baseline" :src="bustedSrc(activeResult.captures.baseline)" alt="baseline capture" />
               <span v-else class="muted small">无</span>
             </td>
             <td>
-              <img v-if="result.captures.probe" :src="bustedSrc(result.captures.probe)" alt="probe capture" />
+              <img v-if="activeResult.captures.probe" :src="bustedSrc(activeResult.captures.probe)" alt="probe capture" />
               <span v-else class="muted small">无</span>
             </td>
             <td>
-              <img v-if="result.captures.restored" :src="bustedSrc(result.captures.restored)" alt="restored capture" />
+              <img v-if="activeResult.captures.restored" :src="bustedSrc(activeResult.captures.restored)" alt="restored capture" />
               <span v-else class="muted small">无</span>
             </td>
           </tr>
@@ -194,65 +250,37 @@ const diffUnderRestore = computed(() => {
             <td>
               <span class="muted small">基准帧</span>
               <br />
-              <span class="muted small">洋红像素占比：{{ pct(result.magenta_ratio_baseline) }}</span>
+              <span class="muted small">洋红像素占比：{{ pct(activeResult.magenta_ratio_baseline) }}</span>
             </td>
             <td>
               色差 vs baseline：
               <strong :class="{ 'metric-good': diffOverChange, 'metric-bad': !diffOverChange }">
-                {{ fmtDiff(result.mean_diff_baseline_probe) }}
+                {{ fmtDiff(activeResult.mean_diff_baseline_probe) }}
               </strong>
-              <span class="muted small"> / 阈值 {{ fmtDiff(result.mean_diff_change_threshold) }}</span>
+              <span class="muted small"> / 阈值 {{ fmtDiff(activeResult.mean_diff_change_threshold) }}</span>
               <br />
-              <span class="muted small">洋红像素占比 {{ pct(result.magenta_ratio_probe) }}（辅助）</span>
+              <span class="muted small">洋红像素占比 {{ pct(activeResult.magenta_ratio_probe) }}（辅助）</span>
             </td>
             <td>
               色差 vs baseline：
               <strong :class="{ 'metric-good': diffUnderRestore, 'metric-bad': !diffUnderRestore }">
-                {{ fmtDiff(result.mean_diff_baseline_restored) }}
+                {{ fmtDiff(activeResult.mean_diff_baseline_restored) }}
               </strong>
-              <span class="muted small"> / 阈值 ≤ {{ fmtDiff(result.mean_diff_restore_threshold) }}</span>
+              <span class="muted small"> / 阈值 ≤ {{ fmtDiff(activeResult.mean_diff_restore_threshold) }}</span>
               <br />
-              <span class="muted small">洋红像素占比 {{ pct(result.magenta_ratio_restored) }}（辅助）</span>
+              <span class="muted small">洋红像素占比 {{ pct(activeResult.magenta_ratio_restored) }}（辅助）</span>
             </td>
           </tr>
         </tbody>
       </table>
 
-      <p v-if="result.error" class="muted small" style="margin-top: 4px;">
-        内部错误：<span class="mono">{{ result.error }}</span>
+      <p v-if="activeResult.error" class="muted small" style="margin-top: 4px;">
+        内部错误：<span class="mono">{{ activeResult.error }}</span>
       </p>
-      <ul v-if="result.notes && result.notes.length" class="ph-notes muted small">
-        <li v-for="(note, i) in result.notes" :key="i">{{ note }}</li>
+      <ul v-if="activeResult.notes && activeResult.notes.length" class="ph-notes muted small">
+        <li v-for="(note, i) in activeResult.notes" :key="i">{{ note }}</li>
       </ul>
 
-      <div v-if="result.focus_log && result.focus_log.length" class="ph-focus">
-        <div class="ph-focus-head">
-          <strong>Laya 窗口聚焦日志</strong>
-          <span class="muted small" :class="{ 'focus-bad': anyFocusFailed }">
-            {{ anyFocusFailed
-              ? '部分步骤未能成功聚焦 — 探针可能拿到了旧帧'
-              : '5 个步骤都已聚焦到 Laya 窗口' }}
-          </span>
-        </div>
-        <table class="ph-focus-table">
-          <thead>
-            <tr>
-              <th>步骤</th>
-              <th>结果</th>
-              <th>命中窗口</th>
-              <th>说明</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="(entry, i) in result.focus_log" :key="i" :class="{ 'focus-bad-row': !entry.success }">
-              <td class="mono">{{ entry.step }}</td>
-              <td>{{ entry.success ? '✓' : '✗' }}</td>
-              <td class="mono">{{ entry.process_name || '—' }} / {{ entry.title || '—' }}</td>
-              <td>{{ entry.reason }}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
     </div>
   </section>
 </template>
@@ -309,7 +337,7 @@ const diffUnderRestore = computed(() => {
   max-width: 100%;
   max-height: 220px;
   border: 1px solid var(--border);
-  background: #000;
+  background: #0d1117;
   image-rendering: pixelated;
 }
 .ph-ratiorow td { padding: 6px 8px; font-family: var(--mono); font-size: 12px; vertical-align: top; }

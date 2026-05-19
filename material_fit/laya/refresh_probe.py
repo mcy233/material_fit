@@ -184,6 +184,98 @@ and the user is responsible for keeping Laya in the foreground."""
 # Public API
 
 
+def build_probe_options(
+    *,
+    laya_material_path: str | Path,
+    laya_shader_params: Sequence[Any] | None = None,
+) -> dict[str, Any]:
+    """Return Color-like .lmat params suitable for the refresh probe."""
+
+    material_params = _load_material_params(laya_material_path)
+    shader_by_name = _shader_param_meta_by_name(laya_shader_params)
+    color_names: list[str] = []
+    for name, value in material_params.items():
+        meta = shader_by_name.get(str(name), {})
+        param_type = str(meta.get("param_type") or meta.get("type") or "").lower()
+        is_color_type = param_type == "color"
+        is_color_value = (
+            isinstance(value, list)
+            and len(value) >= 3
+            and all(isinstance(item, (int, float)) for item in value[:3])
+        )
+        if is_color_type or is_color_value:
+            color_names.append(str(name))
+
+    recommended = _recommended_probe_param(color_names)
+    options = [
+        {
+            "name": name,
+            "param_type": str(shader_by_name.get(name, {}).get("param_type") or "Color"),
+            "current_value": material_params.get(name),
+            "recommended": name == recommended,
+        }
+        for name in color_names
+    ]
+    return {
+        "recommended": recommended,
+        "options": options,
+    }
+
+
+def resolve_probe_param(
+    *,
+    requested: str | None,
+    laya_material_path: str | Path,
+    laya_shader_params: Sequence[Any] | None = None,
+) -> str:
+    """Resolve a requested probe param to a Color-like param that exists."""
+
+    requested_name = str(requested or "")
+    material_params = _load_material_params(laya_material_path)
+    if requested_name and requested_name in material_params:
+        return requested_name
+    options = build_probe_options(
+        laya_material_path=laya_material_path,
+        laya_shader_params=laya_shader_params,
+    )
+    recommended = options.get("recommended")
+    if isinstance(recommended, str) and recommended:
+        return recommended
+    return requested_name or ProbeConfig.probe_param
+
+
+def _load_material_params(laya_material_path: str | Path) -> dict[str, Any]:
+    try:
+        material = lmat_io.load_lmat(laya_material_path)
+        return lmat_io.extract_params(material)
+    except Exception:
+        return {}
+
+
+def _shader_param_meta_by_name(laya_shader_params: Sequence[Any] | None) -> dict[str, dict[str, Any]]:
+    by_name: dict[str, dict[str, Any]] = {}
+    for param in laya_shader_params or []:
+        if isinstance(param, dict):
+            name = param.get("name")
+            if name:
+                by_name[str(name)] = dict(param)
+            continue
+        name = getattr(param, "name", "")
+        if not name:
+            continue
+        by_name[str(name)] = {
+            "name": str(name),
+            "param_type": getattr(param, "param_type", ""),
+            "default": getattr(param, "default", None),
+        }
+    return by_name
+
+
+def _recommended_probe_param(color_names: Sequence[str]) -> str | None:
+    preferred = ["u_BaseColor", "u_Color", "u_MainColor", "u_TintColor", "u_AlbedoColor"]
+    return next((name for name in preferred if name in color_names), None) or (color_names[0] if color_names else None)
+
+
 def run_refresh_probe(
     *,
     laya_material_path: str | Path,
@@ -256,7 +348,11 @@ def run_refresh_probe(
 
     try:
         # Step 0: back up the .lmat byte-for-byte before *any* write.
-        backup_path = lmat_io.backup_lmat(laya_material_path, suffix=".refresh_probe.bak")
+        backup_path = lmat_io.backup_lmat(
+            laya_material_path,
+            suffix=".refresh_probe.bak",
+            target_dir=output_dir_path / "external_backups",
+        )
         notes.append(f"backup written to {backup_path}")
 
         # Step 1: baseline capture (no modification).

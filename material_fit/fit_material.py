@@ -7,16 +7,13 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from .auto_adjust.scoring import (
-    diff_score_to_fit_score as _diff_score_to_fit_score,
-    extract_perceptual_signals as _extract_perceptual_signals,
-    resolve_fit_score as _resolve_fit_score,
-)
+from .auto_adjust.scoring import extract_perceptual_signals as _extract_perceptual_signals
 from .auto_adjust.history import load_warm_start_history as _load_warm_start_history
-from .auto_adjust.image_pairs import collect_image_pairs as _collect_image_pairs
+from .auto_adjust.image_pairs import ImagePairCollectionError, collect_image_pairs as _collect_image_pairs
 from .laya import lmat_io
-from .laya.refresh_probe import ProbeConfig, run_refresh_probe
+from .laya.refresh_probe import ProbeConfig, resolve_probe_param, run_refresh_probe
 from .laya.render_driver import RenderDriver
+from .laya_capture.editor_bridge import LayaEditorCaptureError, trigger_editor_multiview_capture, trigger_editor_single_view_capture
 from .laya.shader_parser import parse_laya_shader, shader_info_to_dict
 from .laya.window_focus import FocusTarget, focus_laya_window
 from .optimizer.adjustment_algorithm import (
@@ -38,7 +35,7 @@ from .optimizer.strategy import (
 )
 from .shared.report import write_summary_report
 from .unity.shader_parser import parse_unity_shaderlab
-from .vision.diff_analysis import ImageDiffConfig, analyze_image_diff
+from .vision.diff_analysis import ImageDiffConfig, analyze_image_diff, analyze_multiview_pairs
 from .vision.screen_capture import (
     DEFAULT_CAPTURE_DIR,
     DEFAULT_PREFIX,
@@ -219,17 +216,26 @@ def main() -> int:
     image_analysis = []
     if args.analyze_images:
         image_pairs = _collect_image_pairs(config, project_root, output_dir)
-        for index, pair in enumerate(image_pairs):
-            image_analysis.append(
-                analyze_image_diff(
-                    ImageDiffConfig(
-                        reference_path=pair["reference"],
-                        candidate_path=pair["candidate"],
-                        mask_path=pair.get("mask"),
-                        output_dir=output_dir / "image_analysis" / f"pair_{index:02d}",
+        fit_score_mode = args.fit_score_mode or str(config.get("fit_score_mode", "human_accept")).lower()
+        if len(image_pairs) > 1:
+            image_analysis = analyze_multiview_pairs(
+                image_pairs,
+                output_dir / "image_analysis",
+                fit_score_mode=fit_score_mode,
+                aggregation_config=config.get("multiview_scoring") if isinstance(config.get("multiview_scoring"), dict) else None,
+            )
+        else:
+            for index, pair in enumerate(image_pairs):
+                image_analysis.append(
+                    analyze_image_diff(
+                        ImageDiffConfig(
+                            reference_path=pair["reference"],
+                            candidate_path=pair["candidate"],
+                            mask_path=pair.get("mask"),
+                            output_dir=output_dir / "image_analysis" / f"pair_{index:02d}",
+                        )
                     )
                 )
-            )
         _write_json(output_dir / "image_analysis.json", image_analysis)
 
     adjustment_result: dict[str, Any] | None = None
@@ -243,20 +249,28 @@ def main() -> int:
         cma_es_config = cmaes_strategy_config_from_dict(config.get("cma_es"))
         cma_es_config = _override_cmaes_from_cli(args, cma_es_config)
         rerender_wait_ms_value = int(args.rerender_wait_ms if args.rerender_wait_ms is not None else config.get("rerender_wait_ms", 1200))
-        capture_screen_after_apply_value = args.capture_screen_after_apply or bool(config.get("capture_screen_after_apply", False))
+        editor_capture_enabled = bool(
+            isinstance(config.get("laya_editor_capture"), dict)
+            and config["laya_editor_capture"].get("enabled")
+        )
+        capture_screen_after_apply_value = (
+            False
+            if editor_capture_enabled
+            else args.capture_screen_after_apply or bool(config.get("capture_screen_after_apply", False))
+        )
 
         # Build a focus callback that brings the Laya window forward
         # before each .lmat write and each capture. Without this, Laya
         # silently pauses rendering when its window loses focus
         # (validated in E-007 of ExperimentLog.md), so probe / capture
         # both freeze on a stale frame.
-        focus_callback = _build_focus_callback(args, config)
+        focus_callback = None if editor_capture_enabled else _build_focus_callback(args, config)
 
-        # E-007 (ExperimentLog.md): magenta-probe preflight that
-        # validates Laya is actually re-rendering after each .lmat
-        # write. Without this, every fit_score below is computed on a
-        # stale frame and the whole optimizer is fighting a ghost.
-        if (args.laya_refresh_check or bool(config.get("laya_refresh_check", False))) and args.apply_lmat:
+        # The refresh probe is a manual diagnostic / project preflight tool.
+        # Formal auto-adjust runs should not read a config default and write an
+        # extra probe value before the first iteration, because that can disturb
+        # the user's intended initial material state.
+        if args.laya_refresh_check and args.apply_lmat:
             preflight = _run_laya_refresh_preflight(
                 config=config,
                 project_root=project_root,
@@ -414,11 +428,12 @@ def _run_auto_adjustment(
 
     auto_dir = output_dir / "auto_adjust"
     auto_dir.mkdir(parents=True, exist_ok=True)
+    external_backup_dir = _resolve_external_backup_dir(config, project_root, output_dir)
     state = AdjustmentState(best_params=dict(initial_params))
     current_params = dict(initial_params)
     result_iterations: list[dict[str, Any]] = []
     best_fit_score = -math.inf
-    candidate_override: str | None = None
+    candidate_override: str | dict[str, str] | None = None
     require_real_closed_loop = apply_lmat and capture_screen_after_apply
 
     warm_history: list[tuple[dict[str, Any], float]] = []
@@ -469,7 +484,38 @@ def _run_auto_adjustment(
         iteration_dir = auto_dir / f"iter_{iteration:04d}"
         iteration_dir.mkdir(parents=True, exist_ok=True)
 
-        image_pairs = _collect_image_pairs(config, project_root, output_dir, candidate_override=candidate_override)
+        initial_editor_capture_result: dict[str, Any] | None = None
+        if candidate_override is None:
+            try:
+                initial_editor_capture_result = trigger_editor_multiview_capture(
+                    config=config,
+                    project_root=project_root,
+                    iteration_dir=iteration_dir / "current",
+                    iteration=iteration,
+                    laya_material_path=laya_material_path,
+                )
+            except LayaEditorCaptureError as exc:
+                initial_editor_capture_result = {
+                    "status": "failed",
+                    "error": str(exc),
+                    "screenshots": [],
+                }
+            if initial_editor_capture_result is not None:
+                candidate_overrides = initial_editor_capture_result.get("candidate_overrides")
+                if isinstance(candidate_overrides, dict) and candidate_overrides:
+                    candidate_override = {str(key): str(value) for key, value in candidate_overrides.items()}
+
+        try:
+            image_pairs = _collect_image_pairs(config, project_root, output_dir, candidate_override=candidate_override)
+        except ImagePairCollectionError as exc:
+            payload = {
+                "status": "failed",
+                "reason": str(exc),
+                "target_score": target_score,
+                "iterations": result_iterations,
+            }
+            _write_json(auto_dir / "auto_adjust_result.json", payload)
+            return payload
         if not image_pairs:
             payload = {
                 "status": "pending",
@@ -481,19 +527,25 @@ def _run_auto_adjustment(
             return payload
 
         pair = image_pairs[0]
-        analysis = analyze_image_diff(
-            ImageDiffConfig(
-                reference_path=pair["reference"],
-                candidate_path=pair["candidate"],
-                mask_path=pair.get("mask"),
-                output_dir=iteration_dir / "image_analysis",
-            )
+        multiview_result = analyze_multiview_pairs(
+            image_pairs,
+            iteration_dir / "image_analysis",
+            fit_score_mode=fit_score_mode,
+            aggregation_config=config.get("multiview_scoring") if isinstance(config.get("multiview_scoring"), dict) else None,
         )
-        diff_score = float(analysis.get("score", math.inf)) if isinstance(analysis.get("score"), (int, float)) else math.inf
-        # Prefer the configured headline score for optimization while
-        # keeping all stricter pixel/perceptual signals in the iteration
-        # payload for diagnosis.
-        fit_score = _resolve_fit_score(analysis, diff_score, mode=fit_score_mode)
+        multiview_analysis = (
+            multiview_result.get("multiview_analysis")
+            if isinstance(multiview_result.get("multiview_analysis"), dict)
+            else {}
+        )
+        multiview_summary = multiview_analysis.get("summary") if isinstance(multiview_analysis.get("summary"), dict) else {}
+        analysis = dict(multiview_result.get("strategy_analysis") if isinstance(multiview_result.get("strategy_analysis"), dict) else {})
+        diff_score = _number_or_default(multiview_summary.get("mean_diff_score"), math.inf)
+        fit_score = _number_or_default(multiview_summary.get("mean_fit_score"), -math.inf)
+        if not analysis:
+            analysis = {"status": "pending", "score": diff_score, "multiview": multiview_analysis}
+        analysis["score"] = diff_score
+        analysis["multiview"] = multiview_analysis
         if fit_score > best_fit_score:
             best_fit_score = fit_score
         if diff_score < state.best_score:
@@ -504,11 +556,15 @@ def _run_auto_adjustment(
             iteration_payload = {
                 "iteration": iteration,
                 "input_pair": pair,
+                "input_pairs": image_pairs,
                 "diff_score_before": diff_score,
                 "fit_score_before": fit_score,
                 "target_score": target_score,
                 "selected_stage": "target_reached",
                 "decision": {"stop_reason": "target_score_reached"},
+                "perceptual_signals": _extract_perceptual_signals(analysis),
+                "multiview_analysis": multiview_analysis,
+                "initial_editor_capture_result": initial_editor_capture_result,
             }
             _write_json(iteration_dir / "decision.json", iteration_payload)
             result_iterations.append(iteration_payload)
@@ -525,6 +581,7 @@ def _run_auto_adjustment(
             iteration_payload = {
                 "iteration": iteration,
                 "input_pair": pair,
+                "input_pairs": image_pairs,
                 "diff_score_before": diff_score,
                 "fit_score_before": fit_score,
                 "target_score": target_score,
@@ -533,6 +590,9 @@ def _run_auto_adjustment(
                     "stop_reason": "global_no_improvement",
                     "global_no_improve": state.global_no_improve,
                 },
+                "perceptual_signals": _extract_perceptual_signals(analysis),
+                "multiview_analysis": multiview_analysis,
+                "initial_editor_capture_result": initial_editor_capture_result,
             }
             _write_json(iteration_dir / "decision.json", iteration_payload)
             result_iterations.append(iteration_payload)
@@ -577,6 +637,22 @@ def _run_auto_adjustment(
                 f"breaking out of auto_adjust loop early.",
                 flush=True,
             )
+            iteration_payload = {
+                "iteration": iteration,
+                "input_pair": pair,
+                "input_pairs": image_pairs,
+                "diff_score_before": diff_score,
+                "fit_score_before": fit_score,
+                "target_score": target_score,
+                "selected_stage": None,
+                "decision": decision,
+                "perceptual_signals": _extract_perceptual_signals(analysis),
+                "multiview_analysis": multiview_analysis,
+                "initial_editor_capture_result": initial_editor_capture_result,
+            }
+            _write_json(iteration_dir / "decision.json", iteration_payload)
+            result_iterations.append(iteration_payload)
+            state.history.append(iteration_payload)
             break
         if diff_score < state.best_score - 1e-6:
             state.global_no_improve = 0
@@ -604,7 +680,11 @@ def _run_auto_adjustment(
             # queues file events but does not redraw — see E-007.
             if focus_callback is not None:
                 focus_log.append(focus_callback(f"iter_{iteration:04d}_before_lmat_write"))
-            backup_path = lmat_io.backup_lmat(laya_material_path, suffix=f".auto_adjust_{iteration:04d}.bak")
+            backup_path = lmat_io.backup_lmat(
+                laya_material_path,
+                suffix=f".auto_adjust_{iteration:04d}.bak",
+                target_dir=external_backup_dir,
+            )
             lmat_io.write_candidate_lmat(
                 laya_material_path,
                 laya_material_path,
@@ -614,9 +694,29 @@ def _run_auto_adjustment(
             decision["applied_lmat"] = str(laya_material_path)
             decision["backup_lmat"] = str(backup_path)
 
-        render_result = driver.capture_candidate(iteration, next_params) if use_capture else driver.render_candidate(iteration, next_params)
+        try:
+            editor_capture_result = trigger_editor_multiview_capture(
+                config=config,
+                project_root=project_root,
+                iteration_dir=iteration_dir / "candidate",
+                iteration=iteration,
+                laya_material_path=laya_material_path,
+            )
+        except LayaEditorCaptureError as exc:
+            editor_capture_result = {
+                "status": "failed",
+                "error": str(exc),
+                "screenshots": [],
+            }
+        if editor_capture_result is not None:
+            render_result = editor_capture_result
+        else:
+            render_result = driver.capture_candidate(iteration, next_params) if use_capture else driver.render_candidate(iteration, next_params)
         screenshots = render_result.get("screenshots", []) if isinstance(render_result, dict) else []
-        if screenshots:
+        candidate_overrides = render_result.get("candidate_overrides") if isinstance(render_result, dict) else None
+        if isinstance(candidate_overrides, dict) and candidate_overrides:
+            candidate_override = {str(key): str(value) for key, value in candidate_overrides.items()}
+        elif screenshots:
             candidate_override = str(screenshots[0])
 
         screen_capture_result: dict[str, Any] | None = None
@@ -703,6 +803,7 @@ def _run_auto_adjustment(
         iteration_payload = {
             "iteration": iteration,
             "input_pair": pair,
+            "input_pairs": image_pairs,
             "diff_score_before": diff_score,
             "fit_score_before": fit_score,
             "target_score": target_score,
@@ -711,12 +812,14 @@ def _run_auto_adjustment(
             "params_path": str(params_path),
             "candidate_lmat_path": candidate_lmat_path,
             "render_result": render_result,
+            "initial_editor_capture_result": initial_editor_capture_result,
             "screen_capture_after_apply": screen_capture_result,
             # Keep both strict and tolerant signals next to the headline
             # fit_score so post-mortems can tell whether a regression came
             # from MAE drift, SSIM drift, auto-mask coverage, or human-score
             # component drift.
             "perceptual_signals": _extract_perceptual_signals(analysis),
+            "multiview_analysis": multiview_analysis,
         }
         strategy_stop = strategy.stop_reason()
         if strategy_stop:
@@ -752,6 +855,28 @@ def _run_auto_adjustment(
     return payload
 
 
+def _resolve_external_backup_dir(config: dict[str, Any], project_root: Path, output_dir: Path) -> Path:
+    backup_dir_value = config.get("external_backup_dir")
+    if backup_dir_value:
+        return _resolve_path(project_root, str(backup_dir_value))
+    return output_dir / "external_backups"
+
+
+def _mean_finite(values: list[float], *, default: float) -> float:
+    finite = [value for value in values if math.isfinite(value)]
+    if not finite:
+        return default
+    return sum(finite) / len(finite)
+
+
+def _number_or_default(value: Any, default: float) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return default
+    return numeric if math.isfinite(numeric) else default
+
+
 def _run_laya_refresh_preflight(
     *,
     config: dict[str, Any],
@@ -764,23 +889,37 @@ def _run_laya_refresh_preflight(
     probe_param: str,
     focus_callback: Callable[[str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Run the magenta-probe refresh preflight using the *same* screen
-    capture path the auto-adjust loop will use.
+    """Run the magenta-probe refresh preflight before auto-adjust.
 
-    This is critical: probing with a different capture path than the
-    real loop would prove nothing about the loop's correctness. We
-    therefore reuse :func:`capture_laya_region` and the project's
-    ``screen_capture`` config verbatim.
+    When ``laya_editor_capture.enabled`` is on, probe with the same
+    editor command/reimport path as the real loop, but only capture the
+    front-facing 0-degree view. The full eight-view capture is reserved
+    for actual scoring iterations.
     """
 
     screen_capture_cfg = config.get("screen_capture", {}) if isinstance(config.get("screen_capture"), dict) else {}
+    editor_capture_cfg = config.get("laya_editor_capture") if isinstance(config.get("laya_editor_capture"), dict) else {}
+    if not isinstance(config.get("laya_editor_capture"), dict):
+        config["laya_editor_capture"] = editor_capture_cfg
+    # Refresh preflight must use the Laya Editor script path. Do not fall
+    # back to desktop-region screenshots, otherwise the probe validates a
+    # different capture path than the automated material-fit loop.
+    editor_capture_cfg["enabled"] = True
+    # The certified refresh path is material reimport only. Reloading the
+    # whole scene is slower and can disturb model transforms before capture.
+    editor_capture_cfg["reload_scene_after_reimport"] = False
     capture_dir = _resolve_path(project_root, screen_capture_cfg.get("capture_dir", str(DEFAULT_CAPTURE_DIR)))
     state_file_value = screen_capture_cfg.get("state_file")
     state_file = _resolve_path(project_root, state_file_value) if state_file_value else capture_dir / ".capture_region.json"
     region_text = screen_capture_region or str(screen_capture_cfg.get("region", ""))
     explicit_region = parse_region(region_text) if region_text else None
 
-    preflight_capture_dir = output_dir / "auto_adjust" / "preflight_captures"
+    preflight_dir_value = config.get("project_preflight_dir")
+    preflight_capture_dir = (
+        _resolve_path(project_root, str(preflight_dir_value))
+        if preflight_dir_value
+        else output_dir / "auto_adjust" / "preflight_captures"
+    )
     preflight_capture_dir.mkdir(parents=True, exist_ok=True)
 
     anchor = _build_capture_anchor(config)
@@ -793,39 +932,95 @@ def _run_laya_refresh_preflight(
         probe_cfg.get("mean_diff_restore_threshold"),
         2.5,
     )
+    resolved_probe_param = resolve_probe_param(
+        requested=probe_param,
+        laya_material_path=laya_material_path,
+        laya_shader_params=laya_shader_params,
+    )
 
     def _capture(step: str) -> Path:
-        # Probe writes exactly three fixed-name files. Skip the
-        # rolling ``prefix_NN.png`` pool (used by the real auto-adjust
-        # loop) so each probe run doesn't leak 3 extra garbage
-        # captures into ``test_image``. See E-012 in ExperimentLog.
-        dest = preflight_capture_dir / f"{step}.png"
-        result = capture_laya_region(
-            region=explicit_region,
-            reuse_last=explicit_region is None,
-            capture_dir=capture_dir,
-            state_file=state_file,
-            prefix=str(screen_capture_cfg.get("prefix", DEFAULT_PREFIX)),
-            dry_run=False,
-            anchor=anchor,
-            output_path=dest,
-        )
-        return Path(result["output_path"])
+        try:
+            result = trigger_editor_single_view_capture(
+                config=config,
+                project_root=project_root,
+                output_dir=preflight_capture_dir,
+                nonce_prefix=f"preflight-{step}",
+                laya_material_path=laya_material_path,
+                file_name=f"{step}.png",
+            )
+        except LayaEditorCaptureError as exc:
+            raise RuntimeError(str(exc)) from exc
+        screenshots = result.get("screenshots", []) if isinstance(result, dict) else []
+        if not screenshots:
+            raise RuntimeError(f"Laya editor selected-camera preflight produced no screenshot for {step}")
+        return Path(str(screenshots[0]))
 
     probe_result = run_refresh_probe(
         laya_material_path=laya_material_path,
         laya_shader_params=laya_shader_params,
         capture=_capture,
         config=ProbeConfig(
-            probe_param=probe_param,
+            probe_param=resolved_probe_param,
             rerender_wait_ms=rerender_wait_ms,
             mean_diff_change_threshold=change_threshold,
             mean_diff_restore_threshold=restore_threshold,
         ),
         output_dir=preflight_capture_dir,
-        focus=focus_callback,
+        focus=None,
     )
-    return probe_result.to_dict()
+    payload = probe_result.to_dict()
+    payload["capture_method"] = "laya_editor_selected_camera"
+    payload["requested_probe_param"] = probe_param
+    if payload.get("success"):
+        cert = _build_refresh_session_cert(
+            config=config,
+            laya_material_path=laya_material_path,
+            probe_payload=payload,
+            preflight_dir=preflight_capture_dir,
+        )
+        _write_json(preflight_capture_dir / "refresh_session_cert.json", cert)
+        payload["refresh_session_cert"] = str((preflight_capture_dir / "refresh_session_cert.json").resolve())
+    return payload
+
+
+def _build_refresh_session_cert(
+    *,
+    config: dict[str, Any],
+    laya_material_path: Path,
+    probe_payload: dict[str, Any],
+    preflight_dir: Path,
+) -> dict[str, Any]:
+    import datetime as _dt
+
+    editor_capture = config.get("laya_editor_capture") if isinstance(config.get("laya_editor_capture"), dict) else {}
+    report_path = preflight_dir / "laya_editor_selected_camera_report.json"
+    script_version = ""
+    if report_path.exists():
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8-sig"))
+            diagnostics = report.get("render_diagnostics") if isinstance(report, dict) else {}
+            if isinstance(diagnostics, dict):
+                script_version = str(diagnostics.get("script_version") or "")
+        except (OSError, json.JSONDecodeError):
+            script_version = ""
+    refresh_assets = editor_capture.get("refresh_assets") if isinstance(editor_capture.get("refresh_assets"), list) else []
+    return {
+        "success": True,
+        "cert_type": "laya_lmat_reimport_session",
+        "verified_at": _dt.datetime.now().isoformat(timespec="seconds"),
+        "laya_project": str(editor_capture.get("laya_project") or ""),
+        "command_path": str(editor_capture.get("command_path") or ""),
+        "lmat_path": str(laya_material_path.resolve()),
+        "refresh_assets": [str(item) for item in refresh_assets],
+        "reload_scene_after_reimport": False,
+        "reimport_only": True,
+        "capture_method": probe_payload.get("capture_method"),
+        "probe_param": probe_payload.get("probe_param"),
+        "probe_value": probe_payload.get("probe_value"),
+        "mean_diff_baseline_probe": probe_payload.get("mean_diff_baseline_probe"),
+        "mean_diff_baseline_restored": probe_payload.get("mean_diff_baseline_restored"),
+        "script_version": script_version,
+    }
 
 
 def _build_capture_anchor(config: dict[str, Any]) -> CaptureAnchor | None:

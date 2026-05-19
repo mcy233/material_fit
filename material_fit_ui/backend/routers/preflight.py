@@ -10,6 +10,16 @@ from .common import config, optional_float
 router = APIRouter()
 
 
+@router.get("/api/projects/{project_id}/preflight/laya_probe_options")
+def api_get_laya_probe_options(project_id: str) -> dict[str, Any]:
+    try:
+        return preflight.get_laya_probe_options(project_id, config=config())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.post("/api/projects/{project_id}/preflight/laya_refresh")
 def api_run_laya_refresh_preflight(
     project_id: str,

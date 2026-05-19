@@ -8,7 +8,7 @@ Spawned as a short-lived subprocess by ``file_dialog.pick`` so that:
 stdin payload (JSON, single line)::
 
     {
-      "mode":          "open" | "save" | "directory",
+      "mode":          "open" | "open_many" | "save" | "directory",
       "title":         str,
       "initial_dir":   str | null,
       "initial_file":  str | null,
@@ -17,7 +17,7 @@ stdin payload (JSON, single line)::
 
 stdout payload (JSON, single line)::
 
-    {"path": "<absolute path or empty string if cancelled>"}
+    {"path": "<absolute path or empty string if cancelled>", "paths": ["<absolute path>", ...]}
 """
 
 from __future__ import annotations
@@ -78,8 +78,18 @@ def main() -> int:
                 initialfile=initial_file,
                 filetypes=filetypes or [("All files", "*.*")],
             )
+            paths: tuple[str, ...] | list[str] = ()
         elif mode == "directory":
             path = filedialog.askdirectory(title=title, initialdir=initial_dir)
+            paths = ()
+        elif mode == "open_many":
+            paths = filedialog.askopenfilenames(
+                title=title,
+                initialdir=initial_dir,
+                initialfile=initial_file,
+                filetypes=filetypes or [("All files", "*.*")],
+            )
+            path = paths[0] if paths else ""
         else:
             path = filedialog.askopenfilename(
                 title=title,
@@ -87,13 +97,14 @@ def main() -> int:
                 initialfile=initial_file,
                 filetypes=filetypes or [("All files", "*.*")],
             )
+            paths = ()
     finally:
         try:
             root.destroy()
         except Exception:
             pass
 
-    sys.stdout.write(json.dumps({"path": path or ""}))
+    sys.stdout.write(json.dumps({"path": path or "", "paths": list(paths or [])}))
     return 0
 
 

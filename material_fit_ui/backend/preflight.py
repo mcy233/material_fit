@@ -21,28 +21,23 @@ from typing import Any
 
 from tools.material_fit.laya.refresh_probe import (
     ProbeConfig,
+    build_probe_options,
+    resolve_probe_param,
     run_refresh_probe,
 )
-from tools.material_fit.laya.window_focus import (
-    FocusTarget,
-    focus_laya_window,
+from tools.material_fit.laya_capture.editor_bridge import (
+    LayaEditorCaptureError,
+    trigger_editor_single_view_capture,
 )
-from tools.material_fit.vision.screen_capture import (
-    DEFAULT_PREFIX,
-    CaptureAnchor,
-    capture_laya_region,
-    parse_region,
-)
-
 from .case_loader import LoaderConfig
-from .project_store import get_project, project_paths
+from .project_store import derive_fit_config, get_project, project_paths
 
 
 def run_laya_refresh_preflight(
     project_id: str,
     *,
     config: LoaderConfig | None = None,
-    probe_param: str = "u_BaseColor",
+    probe_param: str | None = "u_BaseColor",
     mean_diff_change_threshold: float | None = None,
     mean_diff_restore_threshold: float | None = None,
 ) -> dict[str, Any]:
@@ -70,62 +65,45 @@ def run_laya_refresh_preflight(
     laya_material_path = Path(laya_material_path).resolve()
     if not laya_material_path.exists():
         raise FileNotFoundError(f".lmat not found at {laya_material_path}")
-
-    region_dict = inputs.get("laya_capture_region") or {}
-    if not (
-        isinstance(region_dict, dict)
-        and all(k in region_dict for k in ("x", "y", "width", "height"))
-    ):
-        raise ValueError(
-            "project inputs must include laya_capture_region (x, y, width, height) "
-            "before running the refresh probe — otherwise the probe has no viewport "
-            "to capture from"
-        )
-    region = parse_region(
-        f"{int(region_dict['x'])},{int(region_dict['y'])},"
-        f"{int(region_dict['width'])},{int(region_dict['height'])}"
+    fit_config = derive_fit_config(project_id, config=config)
+    laya_shader_params = _read_laya_shader_params(str(inputs.get("laya_shader_path") or ""))
+    probe_options = get_laya_probe_options(project_id, config=config)
+    requested_probe_param = resolve_probe_param(
+        requested=probe_param,
+        laya_material_path=laya_material_path,
+        laya_shader_params=laya_shader_params,
     )
-
-    capture_dir_value = inputs.get("laya_capture_dir")
-    if capture_dir_value:
-        capture_dir = Path(capture_dir_value).resolve()
-    else:
-        capture_dir = (config.image_root / "vision" / "test_image").resolve()
-    capture_dir.mkdir(parents=True, exist_ok=True)
-    state_file_value = inputs.get("laya_capture_state_file")
-    state_file = (
-        Path(state_file_value).resolve()
-        if state_file_value
-        else capture_dir / ".capture_region.json"
-    )
-    prefix = str(inputs.get("laya_capture_prefix") or DEFAULT_PREFIX)
+    editor_capture = fit_config.get("laya_editor_capture")
+    if not isinstance(editor_capture, dict):
+        editor_capture = {}
+        fit_config["laya_editor_capture"] = editor_capture
+    # The UI probe must never fall back to desktop-region screenshots.
+    # It uses the Laya Editor "selected/specified camera" command path
+    # so the captured frame comes directly from Capture Camera.
+    editor_capture["enabled"] = True
+    # Certify the lightweight material reimport path. Reloading the whole
+    # scene can disturb transform state and is intentionally avoided here.
+    editor_capture["reload_scene_after_reimport"] = False
 
     preflight_dir = paths.project_dir / "preflight"
     preflight_dir.mkdir(parents=True, exist_ok=True)
 
-    anchor = _build_capture_anchor(inputs)
-
     def _capture(step: str) -> Path:
-        # The probe wants exactly three fixed-name files
-        # (``baseline.png``, ``probe.png``, ``restored.png``); writing
-        # them through the rolling ``laya_candidate_NN.png`` pool used
-        # by the real auto-adjust loop would (a) leak 3 garbage files
-        # into ``test_image`` per probe run, and (b) make the UI's
-        # cached probe URLs disagree with what's actually on disk.
-        # ``output_path`` short-circuits the pool and writes directly
-        # to the preflight slot.
-        dest = preflight_dir / f"{step}.png"
-        result = capture_laya_region(
-            region=region,
-            reuse_last=False,
-            capture_dir=capture_dir,
-            state_file=state_file,
-            prefix=prefix,
-            dry_run=False,
-            anchor=anchor,
-            output_path=dest,
-        )
-        return Path(result["output_path"])
+        try:
+            result = trigger_editor_single_view_capture(
+                config=fit_config,
+                project_root=config.project_root,
+                output_dir=preflight_dir,
+                nonce_prefix=f"preflight-{step}",
+                laya_material_path=laya_material_path,
+                file_name=f"{step}.png",
+            )
+        except LayaEditorCaptureError as exc:
+            raise RuntimeError(str(exc)) from exc
+        screenshots = result.get("screenshots", []) if isinstance(result, dict) else []
+        if not screenshots:
+            raise RuntimeError(f"Laya editor selected-camera probe produced no screenshot for {step}")
+        return Path(str(screenshots[0]))
 
     rerender_wait_ms = int(algo.get("rerender_wait_ms", 1500))
     probe_cfg = algo.get("laya_refresh_probe") if isinstance(algo.get("laya_refresh_probe"), dict) else {}
@@ -139,25 +117,63 @@ def run_laya_refresh_preflight(
         probe_cfg.get("mean_diff_restore_threshold"),
         2.5,
     )
-    focus_callback = _build_focus_callback(inputs)
     probe = run_refresh_probe(
         laya_material_path=laya_material_path,
         capture=_capture,
         config=ProbeConfig(
-            probe_param=probe_param,
+            probe_param=requested_probe_param,
             rerender_wait_ms=rerender_wait_ms,
             mean_diff_change_threshold=change_threshold,
             mean_diff_restore_threshold=restore_threshold,
         ),
         output_dir=preflight_dir,
-        focus=focus_callback,
+        focus=None,
     )
     payload = probe.to_dict()
+    payload["capture_method"] = "laya_editor_selected_camera"
+    payload["probe_options"] = probe_options
+    cert_path = preflight_dir / "refresh_session_cert.json"
+    if payload.get("success"):
+        cert = _build_refresh_session_cert(
+            fit_config=fit_config,
+            laya_material_path=laya_material_path,
+            probe_payload=payload,
+            preflight_dir=preflight_dir,
+        )
+        cert_path.write_text(_json_dump(cert), encoding="utf-8")
+        payload["refresh_session_cert"] = str(cert_path)
+    elif cert_path.exists():
+        cert_path.unlink()
     # Persist for later inspection.
     last_path = preflight_dir / "last.json"
     last_path.write_text(_json_dump(payload), encoding="utf-8")
     payload["last_path"] = str(last_path)
     return payload
+
+
+def get_laya_probe_options(
+    project_id: str,
+    *,
+    config: LoaderConfig | None = None,
+) -> dict[str, Any]:
+    """Return Color-like .lmat params suitable for the Laya refresh probe."""
+
+    config = config or LoaderConfig()
+    project = get_project(project_id, config)
+    inputs = project.get("inputs") or {}
+    laya_material_path = str(inputs.get("laya_material_lmat_path") or "")
+    laya_shader_path = str(inputs.get("laya_shader_path") or "")
+
+    shader_params = _read_laya_shader_params(laya_shader_path)
+    options = build_probe_options(
+        laya_material_path=laya_material_path,
+        laya_shader_params=shader_params,
+    )
+    return {
+        **options,
+        "laya_shader_path": laya_shader_path,
+        "laya_material_lmat_path": laya_material_path,
+    }
 
 
 def get_last_preflight(
@@ -176,64 +192,44 @@ def get_last_preflight(
         return None
 
 
-def _build_capture_anchor(inputs: dict[str, Any]) -> CaptureAnchor | None:
-    """Construct a :class:`CaptureAnchor` from the project's inputs.
+def _build_refresh_session_cert(
+    *,
+    fit_config: dict[str, Any],
+    laya_material_path: Path,
+    probe_payload: dict[str, Any],
+    preflight_dir: Path,
+) -> dict[str, Any]:
+    import datetime as _dt
 
-    Returns ``None`` (anchor disabled) unless the user explicitly
-    enabled it via ``laya_capture_anchor.enabled = True`` AND we have
-    a meaningful width/height (which gets populated when the user
-    picks a region with the anchor flow). Returning None makes
-    ``capture_laya_region`` fall through to the absolute-region path,
-    which is the legacy behavior.
-    """
-    raw = inputs.get("laya_capture_anchor")
-    if not isinstance(raw, dict) or not raw.get("enabled"):
-        return None
-    width = int(raw.get("width", 0) or 0)
-    height = int(raw.get("height", 0) or 0)
-    if width <= 0 or height <= 0:
-        return None
-    window = inputs.get("laya_window") if isinstance(inputs.get("laya_window"), dict) else {}
-    return CaptureAnchor(
-        enabled=True,
-        offset_x=int(raw.get("offset_x", 0) or 0),
-        offset_y=int(raw.get("offset_y", 0) or 0),
-        width=width,
-        height=height,
-        process_pattern=str(window.get("process_pattern", "LayaAirIDE")),
-        title_pattern=str(window.get("title_pattern", "")),
-    )
-
-
-def _build_focus_callback(inputs: dict[str, Any]):
-    """Build a Laya focus callback from the project's ``laya_window`` block.
-
-    Returns ``None`` if the user explicitly disabled focus by setting
-    ``process_pattern`` to an empty string. The callback signature
-    matches :data:`tools.material_fit.laya.refresh_probe.FocusCallable`.
-
-    Default values: ``process_pattern='LayaAirIDE'`` (covers the
-    Windows installer of LayaAirIDE), no title filter (focuses the
-    first visible Laya window). Users with multiple Laya projects
-    open at once should set ``title_pattern`` to e.g. ``'fish'``
-    to disambiguate.
-    """
-    block = inputs.get("laya_window") or {}
-    if not isinstance(block, dict):
-        block = {}
-    process_pattern = str(block.get("process_pattern", "LayaAirIDE"))
-    title_pattern = str(block.get("title_pattern", ""))
-    settle_ms = int(block.get("settle_ms", 250))
-    if not (process_pattern or title_pattern):
-        return None
-    target = FocusTarget(process_pattern=process_pattern, title_pattern=title_pattern)
-
-    def _focus(step: str) -> dict[str, Any]:
-        result = focus_laya_window(target, settle_ms=settle_ms).to_dict()
-        result["step"] = step
-        return result
-
-    return _focus
+    editor_capture = fit_config.get("laya_editor_capture") if isinstance(fit_config.get("laya_editor_capture"), dict) else {}
+    report_path = preflight_dir / "laya_editor_selected_camera_report.json"
+    script_version = ""
+    if report_path.exists():
+        try:
+            report = _json_load(report_path)
+            diagnostics = report.get("render_diagnostics") if isinstance(report, dict) else {}
+            if isinstance(diagnostics, dict):
+                script_version = str(diagnostics.get("script_version") or "")
+        except (OSError, ValueError):
+            script_version = ""
+    refresh_assets = editor_capture.get("refresh_assets") if isinstance(editor_capture.get("refresh_assets"), list) else []
+    return {
+        "success": True,
+        "cert_type": "laya_lmat_reimport_session",
+        "verified_at": _dt.datetime.now().isoformat(timespec="seconds"),
+        "laya_project": str(editor_capture.get("laya_project") or ""),
+        "command_path": str(editor_capture.get("command_path") or ""),
+        "lmat_path": str(laya_material_path.resolve()),
+        "refresh_assets": [str(item) for item in refresh_assets],
+        "reload_scene_after_reimport": False,
+        "reimport_only": True,
+        "capture_method": probe_payload.get("capture_method"),
+        "probe_param": probe_payload.get("probe_param"),
+        "probe_value": probe_payload.get("probe_value"),
+        "mean_diff_baseline_probe": probe_payload.get("mean_diff_baseline_probe"),
+        "mean_diff_baseline_restored": probe_payload.get("mean_diff_baseline_restored"),
+        "script_version": script_version,
+    }
 
 
 def _coerce_threshold(*values: Any) -> float:
@@ -257,3 +253,14 @@ def _json_dump(data: Any) -> str:
 def _json_load(path: Path) -> Any:
     import json
     return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def _read_laya_shader_params(path: str) -> list[dict[str, Any]]:
+    if not path:
+        return []
+    try:
+        from tools.material_fit.laya.shader_parser import parse_laya_shader, shader_info_to_dict
+
+        return shader_info_to_dict(parse_laya_shader(path)).get("params", [])
+    except Exception:
+        return []
