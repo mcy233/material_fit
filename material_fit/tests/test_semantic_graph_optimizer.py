@@ -24,19 +24,18 @@ from tools.material_fit.optimizer.semantic_graph import (  # noqa: E402
     build_shader_effect_graph,
 )
 from tools.material_fit.optimizer.strategy import (  # noqa: E402
-    SemanticCandidateGenerator,
     SemanticGroupStrategy,
     StrategyContext,
+    build_strategy,
 )
 from tools.material_fit.optimizer.acceptance_policy import AcceptancePolicy  # noqa: E402
 from tools.material_fit.optimizer.branch_guard import BranchDriftGuard  # noqa: E402
-from tools.material_fit.optimizer.breakthrough_candidates import BreakthroughCandidateQueue  # noqa: E402
+from tools.material_fit.optimizer.response_map import ResponseMap  # noqa: E402
 from tools.material_fit.optimizer.search_evidence import (  # noqa: E402
     InfluenceTracker,
     TopKArchive,
     metric_vector_from_analysis,
 )
-from tools.material_fit.optimizer.trust_region import TrustRegionBranch  # noqa: E402
 from tools.material_fit.fit_material import _resolve_auto_adjust_status  # noqa: E402
 from tools.material_fit_ui.backend.project_store import _apply_effective_laya_control_schema  # noqa: E402
 from tools.material_fit_ui.backend.preanalysis import build_effective_laya_control_schema  # noqa: E402
@@ -382,14 +381,8 @@ def test_semantic_graph_marks_unity_suggested_inactive_group_for_probe():
     assert "u_FresnelIntensity" in graph.active_search_params()
 
 
-def test_semantic_group_strategy_walks_ui_panel_order():
-    """The optimizer should follow the human-curated UI panel order.
-
-    When the run console assigns ``order=10`` to ``fresnel`` and a
-    larger order to ``base_color``, ``SemanticGroupStrategy`` must
-    pick ``fresnel`` first regardless of which channel currently has
-    the worst residual.
-    """
+def test_semantic_group_strategy_uses_response_scheduler_not_panel_order():
+    """Panel order is now UI context; the response planner owns scheduling."""
 
     params = dict(_params())
     params["u_FresnelIntensity"] = 1.0
@@ -423,7 +416,9 @@ def test_semantic_group_strategy_walks_ui_panel_order():
     next_params, decision = strategy.propose(ctx)
 
     assert decision["optimizer"] == "semantic_group"
-    assert decision["semantic_group"]["name"] == "fresnel"
+    assert decision["semantic_action"] in {"calibration_probe", "fallback_probe"}
+    assert decision["scheduler"]["planner_phase"] == "calibration"
+    assert "param_ranking" in decision["scheduler"]
     assert next_params != params
     assert decision["changes"]
 
@@ -480,7 +475,7 @@ def test_semantic_group_refine_current_skips_isolation():
     assert next_params["u_EmissionScale"] != 0.0
 
 
-def test_semantic_group_visit_budget_prevents_single_param_starvation():
+def test_response_scheduler_calibrates_multiple_active_params():
     shader_params = [
         ShaderParam("u_EmissionPow", "Float", default=1.0, range_min=0.0, range_max=8.0),
         ShaderParam("u_NormalScale", "Float", default=1.0, range_min=0.0, range_max=2.0),
@@ -497,7 +492,7 @@ def test_semantic_group_visit_budget_prevents_single_param_starvation():
     )
 
     current = dict(params)
-    stages: list[str] = []
+    changed_params: set[str] = set()
     for iteration in range(8):
         current, decision = strategy.propose(
             StrategyContext(
@@ -509,10 +504,10 @@ def test_semantic_group_visit_budget_prevents_single_param_starvation():
                 state=AdjustmentState(best_params=current),
             )
         )
-        stages.append(decision["semantic_group"]["name"])
+        for change in decision.get("changes", []):
+            changed_params.add(str(change.get("param")))
 
-    assert stages[0] == "emission"
-    assert "normal_detail" in stages[1:]
+    assert {"u_EmissionPow", "u_NormalScale"} <= changed_params
 
 
 def test_semantic_group_decision_reports_scheduler_state():
@@ -541,13 +536,112 @@ def test_semantic_group_decision_reports_scheduler_state():
     )
 
     scheduler = decision["scheduler"]
-    assert scheduler["phase"] == "exploration"
-    assert scheduler["selected_group"] == decision["semantic_group"]["name"]
-    assert "emission" in scheduler["group_status"]
-    assert scheduler["group_status"]["emission"]["visit_limit"] >= 6
+    assert scheduler["phase"] == "calibration"
+    assert scheduler["selected_trial_kind"] == decision["semantic_action"]
+    assert scheduler["group_status"] == {}
+    assert "budget_state" in scheduler
+    assert "evidence_status" in scheduler
     assert scheduler["search_param_count"] == 2
     assert len(scheduler["param_ranking"]) == 2
     assert len(scheduler["param_candidate_pool"]) == 2
+    assert "recent_param_counts" in scheduler["budget_state"]
+
+
+def test_optimizer_factory_registers_comparison_strategies():
+    params = dict(_params())
+    params["u_FresnelIntensity"] = 1.0
+    graph = build_shader_effect_graph(_shader_params(), material_params=params)
+
+    current = build_strategy(
+        optimizer="semantic_group",
+        initial_params=params,
+        shader_params=_shader_params(),
+        policies=[],
+        unity_material_params=None,
+        semantic_graph=graph,
+    )
+    legacy = build_strategy(
+        optimizer="semantic_group_legacy_081",
+        initial_params=params,
+        shader_params=_shader_params(),
+        policies=[],
+        unity_material_params=None,
+        semantic_graph=graph,
+    )
+    subspace = build_strategy(
+        optimizer="subspace_cma_es",
+        initial_params=params,
+        shader_params=_shader_params(),
+        policies=[],
+        unity_material_params=None,
+        semantic_graph=graph,
+    )
+
+    assert current.name == "semantic_group"
+    assert legacy.name == "semantic_group_legacy_081"
+    assert subspace.name == "subspace_cma_es"
+
+
+def test_legacy_081_emits_pattern_search_without_response_scheduler():
+    params = dict(_params())
+    params["u_FresnelIntensity"] = 1.0
+    graph = build_shader_effect_graph(_shader_params(), material_params=params)
+    strategy = build_strategy(
+        optimizer="semantic_group_legacy_081",
+        initial_params=params,
+        shader_params=_shader_params(),
+        policies=[],
+        unity_material_params=None,
+        semantic_graph=graph,
+        auto_adjust_mode="refine_current",
+    )
+
+    _, decision = strategy.propose(
+        StrategyContext(
+            iteration=0,
+            current_params=params,
+            analysis={},
+            diff_score=0.5,
+            fit_score=0.5,
+            state=AdjustmentState(best_params=params),
+        )
+    )
+
+    assert decision["optimizer"] == "semantic_group_legacy_081"
+    assert decision["semantic_action"] in {"probe_group", "pattern_search", "cross_group_combo"}
+    assert "scheduler" not in decision
+    assert "response_map" not in decision
+
+
+def test_subspace_cma_es_emits_subspace_diagnostics():
+    pytest.importorskip("cmaes")
+    params = dict(_params())
+    params["u_FresnelIntensity"] = 1.0
+    graph = build_shader_effect_graph(_shader_params(), material_params=params)
+    strategy = build_strategy(
+        optimizer="subspace_cma_es",
+        initial_params=params,
+        shader_params=_shader_params(),
+        policies=[],
+        unity_material_params=None,
+        semantic_graph=graph,
+    )
+
+    _, decision = strategy.propose(
+        StrategyContext(
+            iteration=0,
+            current_params=params,
+            analysis={"research_metrics": {"components": {"color_mean": 0.8, "luminance_mae": 0.4}}},
+            diff_score=0.5,
+            fit_score=0.5,
+            state=AdjustmentState(best_params=params),
+        )
+    )
+
+    assert decision["optimizer"] == "subspace_cma_es"
+    assert decision["semantic_action"] == "subspace_cma_candidate"
+    assert decision["subspace_cma_es"]["subspace_params"]
+    assert decision["subspace_cma_es"]["trainable_dim"] > 0
 
 
 def test_semantic_group_rolls_branch_back_only_after_hard_drift():
@@ -597,7 +691,7 @@ def test_semantic_group_rolls_branch_back_only_after_hard_drift():
     assert previous["next_base_params"] == global_best
 
 
-def test_semantic_group_uses_joint_candidate_for_multi_param_group():
+def test_semantic_group_starts_with_single_calibration_for_multi_param_space():
     shader_params = [
         ShaderParam("u_HueShift", "Float", default=0.0, range_min=-1.0, range_max=1.0),
         ShaderParam("u_Saturation", "Float", default=1.0, range_min=0.0, range_max=2.0),
@@ -623,45 +717,12 @@ def test_semantic_group_uses_joint_candidate_for_multi_param_group():
         )
     )
 
-    assert decision["axis"]["joint"] is True
-    assert len(decision["axis"]["changed_params"]) >= 2
+    assert decision["semantic_action"] == "calibration_probe"
+    assert len(decision["trial"]["changed_params"]) == 1
     assert next_params != params
 
 
-def test_semantic_candidate_generator_cross_group_candidate_changes_two_groups():
-    from tools.material_fit.optimizer.cma_es_optimizer import ParameterEncoder
-
-    shader_params = [
-        ShaderParam("u_EmissionPow", "Float", default=1.0, range_min=0.0, range_max=8.0),
-        ShaderParam("u_NormalScale", "Float", default=1.0, range_min=0.0, range_max=2.0),
-    ]
-    params = {"u_EmissionPow": 1.0, "u_NormalScale": 1.0}
-    graph = build_shader_effect_graph(shader_params, material_params=params)
-    generator = SemanticCandidateGenerator(
-        graph=graph,
-        shader_params=shader_params,
-        encoder_cls=ParameterEncoder,
-        step_schedule=[0.25, 0.14],
-    )
-
-    result = generator.cross_group_candidate(
-        base_params=params,
-        groups=[graph.groups["emission"], graph.groups["normal_detail"]],
-        group_cycle=1,
-        analysis={},
-        base_fit_score=0.5,
-        iteration=10,
-    )
-
-    assert result is not None
-    next_params, payload = result
-    assert next_params["u_EmissionPow"] != params["u_EmissionPow"]
-    assert next_params["u_NormalScale"] != params["u_NormalScale"]
-    assert payload["cross_groups"] == ["emission", "normal_detail"]
-    assert sorted(payload["changed_params"]) == ["u_EmissionPow", "u_NormalScale"]
-
-
-def test_semantic_group_refinement_uses_diagnostic_scores():
+def test_response_scheduler_prioritizes_bottleneck_relevant_params():
     shader_params = [
         ShaderParam("u_EmissionPow", "Float", default=1.0, range_min=0.0, range_max=8.0),
         ShaderParam("u_NormalScale", "Float", default=1.0, range_min=0.0, range_max=2.0),
@@ -676,25 +737,13 @@ def test_semantic_group_refinement_uses_diagnostic_scores():
         graph=graph,
         auto_adjust_mode="refine_current",
     )
-    strategy._state_for_group("emission")["status"] = "exhausted"
-    strategy._state_for_group("normal_detail")["status"] = "exhausted"
-
-    restarted = strategy._restart_exhausted_groups(
-        {
-            "material_channels": {
-                "emission": {"valid": True, "rgb_mae": 0.01},
-                "detail_texture": {"valid": True, "avg_rgb_mae": 0.40},
-            }
-        }
-    )
-
-    assert restarted is True
-    assert strategy._group_order[0] == "normal_detail"
     scheduler = strategy._scheduler_state(
-        "normal_detail",
-        {"material_channels": {"detail_texture": {"valid": True, "avg_rgb_mae": 0.40}}},
+        "calibration_probe",
+        {"research_metrics": {"components": {"structure_ssim_l": 0.40}}},
+        base_params=params,
     )
-    assert scheduler["group_status"]["normal_detail"]["diagnostic_score"] == pytest.approx(0.40)
+    assert scheduler["param_ranking"][0]["param"] == "u_NormalScale"
+    assert scheduler["planner_phase"] == "calibration"
 
 
 def test_metric_vector_extracts_research_components_and_worst_view():
@@ -745,7 +794,7 @@ def test_influence_tracker_prioritizes_matching_metric_bottleneck():
     )
 
 
-def test_semantic_group_breakthrough_restart_reports_active_phase():
+def test_response_scheduler_reports_subspace_phase_after_plateau():
     shader_params = [
         ShaderParam("u_BaseColor", "Color", default=[1, 1, 1, 1]),
         ShaderParam("u_EmissionPow", "Float", default=1.0, range_min=0.0, range_max=8.0),
@@ -759,28 +808,16 @@ def test_semantic_group_breakthrough_restart_reports_active_phase():
         graph=graph,
         auto_adjust_mode="refine_current",
     )
-    for name in strategy._group_order:
-        strategy._state_for_group(name)["status"] = "exhausted"
-    strategy._group_cycle = strategy._breakthrough_cycle - 1
+    for iteration in range(12):
+        strategy._planner._remember_fit(iteration, 0.70)
 
-    restarted = strategy._restart_exhausted_groups(
-        {
-            "research_metrics": {
-                "components": {"color_mean": 0.45, "detail_texture": 0.08},
-            },
-            "material_channels": {"base_color": {"valid": True, "rgb_mae": 0.45}},
-        }
+    scheduler = strategy._scheduler_state(
+        "subspace_batch",
+        {"research_metrics": {"components": {"color_mean": 0.45, "detail_texture": 0.08}}},
+        base_params=params,
     )
 
-    assert restarted is True
-    assert strategy._scheduler_state(
-        "base_color",
-        {
-            "research_metrics": {
-                "components": {"color_mean": 0.45, "detail_texture": 0.08},
-            },
-        },
-    )["phase"] == "refinement"
+    assert scheduler["phase"] == "subspace"
 
 
 def test_topk_archive_selects_restart_matching_bottleneck():
@@ -845,43 +882,6 @@ def test_acceptance_policy_provisionally_accepts_component_gain_in_breakthrough(
     assert decision.reason == "component_bottleneck_improved"
 
 
-def test_breakthrough_candidate_queue_builds_local_population():
-    shader_params = [
-        ShaderParam("u_BaseColor", "Color", default=[1, 1, 1, 1]),
-        ShaderParam("u_EmissionPow", "Float", default=1.0, range_min=0.0, range_max=8.0),
-        ShaderParam("u_NormalScale", "Float", default=1.0, range_min=0.0, range_max=2.0),
-    ]
-    params = {"u_BaseColor": [1, 1, 1, 1], "u_EmissionPow": 1.0, "u_NormalScale": 1.0}
-    graph = build_shader_effect_graph(shader_params, material_params=params)
-    generator = SemanticCandidateGenerator(
-        graph=graph,
-        shader_params=shader_params,
-        encoder_cls=ParameterEncoder,
-        step_schedule=[0.25, 0.14],
-    )
-    queue = BreakthroughCandidateQueue(max_size=4)
-
-    queue.ensure(
-        base_params=params,
-        base_fit_score=0.80,
-        analysis={"research_metrics": {"components": {"color_mean": 0.30}}},
-        iteration=12,
-        group_cycle=3,
-        groups_by_name=graph.groups,
-        group_order=list(graph.groups),
-        group_scores={name: 1.0 for name in graph.groups},
-        active_groups=set(graph.groups),
-        bottleneck={"color_mean": 0.30},
-        archive=TopKArchive(),
-        generator=generator,
-    )
-
-    candidate = queue.pop()
-    assert candidate is not None
-    assert candidate[0] != params
-    assert queue.summary()["generated_count"] > 0
-
-
 def test_auto_adjust_status_reports_breakthrough_exhausted():
     status = _resolve_auto_adjust_status(
         best_fit_score=0.81,
@@ -895,12 +895,13 @@ def test_auto_adjust_status_reports_breakthrough_exhausted():
     assert status == "breakthrough_exhausted"
 
 
-def test_semantic_group_plateau_waits_until_search_space_is_sampled():
+def test_response_scheduler_plateau_routes_to_subspace_trial():
     shader_params = [
         ShaderParam("u_Color", "Color", default=[1, 1, 1, 1]),
         ShaderParam("u_Saturation", "Float", default=1.0, range_min=0.0, range_max=2.0),
+        ShaderParam("u_GammaPower", "Float", default=1.0, range_min=0.05, range_max=3.0),
     ]
-    params = {"u_Color": [1, 1, 1, 1], "u_Saturation": 1.0}
+    params = {"u_Color": [1, 1, 1, 1], "u_Saturation": 1.0, "u_GammaPower": 1.0}
     graph = build_shader_effect_graph(shader_params, material_params=params)
     strategy = SemanticGroupStrategy(
         initial_params=params,
@@ -908,44 +909,35 @@ def test_semantic_group_plateau_waits_until_search_space_is_sampled():
         graph=graph,
         auto_adjust_mode="refine_current",
     )
-    state = AdjustmentState(best_params=params, best_fit_score=0.70, best_fit_params=params)
-
-    for iteration in range(40):
-        strategy._update_plateau_state(
-            StrategyContext(
-                iteration=iteration,
-                current_params=params,
-                analysis={"research_metrics": {"components": {"color_mean": 0.45}}},
-                diff_score=0.3,
-                fit_score=0.70,
-                state=state,
+    for row in strategy._param_ranking(params, {"research_metrics": {"components": {"color_mean": 0.45}}}):
+        for _ in range(2):
+            strategy._response_map.observe_trial(
+                changed_params=[row["param"]],
+                before_params=params,
+                after_params=params,
+                before=metric_vector_from_analysis({"research_metrics": {"components": {"color_mean": 0.45}}}, 0.70),
+                after=metric_vector_from_analysis({"research_metrics": {"components": {"color_mean": 0.44}}}, 0.701),
+                fit_delta=0.001,
+                accepted=True,
+                context_key="score_high:color_mean",
             )
-        )
+    for iteration in range(12):
+        strategy._planner._remember_fit(iteration, 0.70)
 
-    assert strategy._scheduler_phase() == "exploration"
-
-    sampled = 0
-    for name in strategy._group_order:
-        strategy._state_for_group(name)["status"] = "exhausted"
-        sampled += 1
-        if sampled / max(len(strategy._group_order), 1) >= strategy._plateau_min_exhausted_ratio:
-            break
-    strategy._update_plateau_state(
-        StrategyContext(
-            iteration=40,
-            current_params=params,
-            analysis={"research_metrics": {"components": {"color_mean": 0.45}}},
-            diff_score=0.3,
-            fit_score=0.70,
-            state=state,
-        )
+    trial = strategy._planner.next_trial(
+        base_params=params,
+        analysis={"research_metrics": {"components": {"color_mean": 0.45}}},
+        fit_score=0.70,
+        iteration=40,
+        ranking=strategy._param_ranking(params, {"research_metrics": {"components": {"color_mean": 0.45}}}),
+        bottleneck={"color_mean": 0.45},
     )
 
-    assert strategy._scheduler_phase() == "breakthrough"
-    assert strategy._scheduler_state("base_color", {})["force_breakthrough"] is True
+    assert trial is not None
+    assert trial.kind == "subspace_batch"
 
 
-def test_color_bottleneck_active_subspace_keeps_color_related_groups():
+def test_color_bottleneck_ranking_keeps_color_related_params_near_top():
     shader_params = [
         ShaderParam("u_Color", "Color", default=[1, 1, 1, 1]),
         ShaderParam("u_TexPower", "Float", default=1.0, range_min=0.1, range_max=3.0),
@@ -968,13 +960,14 @@ def test_color_bottleneck_active_subspace_keeps_color_related_groups():
         auto_adjust_mode="refine_current",
     )
 
-    active = strategy._active_subspace_groups(
+    ranking = strategy._param_ranking(
+        params,
         {"research_metrics": {"components": {"color_mean": 0.50, "color_p95": 0.45}}}
     )
+    ranked = [item["param"] for item in ranking[:4]]
 
-    assert "base_color" in active
-    assert "color_grade" in active
-    assert "shared_mask_lmap" in active
+    assert "u_Saturation" in ranked
+    assert "u_GammaPower" in ranked
 
 
 def test_param_agenda_prioritizes_bottleneck_relevant_under_sampled_params():
@@ -1051,7 +1044,7 @@ def test_scheduler_reports_runtime_gated_params_separately():
     assert any(item["param"] == "u_FresnelIntensity" for item in scheduler["activation_candidates"])
 
 
-def test_semantic_group_uses_param_priority_before_group_axis_order():
+def test_semantic_group_uses_response_calibration_before_group_axis_order():
     shader_params = [
         ShaderParam("u_NormalScale", "Float", default=1.0, range_min=0.0, range_max=2.0),
         ShaderParam("u_Saturation", "Float", default=1.0, range_min=0.0, range_max=2.0),
@@ -1076,8 +1069,8 @@ def test_semantic_group_uses_param_priority_before_group_axis_order():
         )
     )
 
-    assert decision["semantic_action"] == "param_priority_search"
-    assert decision["param_priority_choice"]["param"] == "u_Saturation"
+    assert decision["semantic_action"] == "calibration_probe"
+    assert decision["trial"]["row"]["param"] == "u_Saturation"
 
 
 def test_fresh_fit_does_not_force_accept_isolation_candidate():
@@ -1109,7 +1102,7 @@ def test_fresh_fit_does_not_force_accept_isolation_candidate():
     assert decision.get("stage", {}).get("name") != "isolate_base"
 
 
-def test_breakthrough_waits_for_required_bottleneck_groups_to_be_sampled():
+def test_scheduler_no_longer_uses_breakthrough_as_special_phase():
     shader_params = [
         ShaderParam("u_Color", "Color", default=[1, 1, 1, 1]),
         ShaderParam("u_TexPower", "Float", default=1.0, range_min=0.1, range_max=3.0),
@@ -1137,130 +1130,13 @@ def test_breakthrough_waits_for_required_bottleneck_groups_to_be_sampled():
         graph=graph,
         auto_adjust_mode="refine_current",
     )
-    strategy._force_breakthrough = True
     analysis = {"research_metrics": {"components": {"color_mean": 0.50, "highlight": 0.30}}}
 
-    assert strategy._scheduler_state("base_color", analysis)["phase"] == "refinement"
+    scheduler = strategy._scheduler_state("calibration_probe", analysis, base_params=params)
 
-    for group_name in strategy._required_groups_before_breakthrough(analysis):
-        state = strategy._state_for_group(group_name)
-        state["visit_attempts"] = strategy._minimum_group_coverage(group_name)
-        state["no_improve"] = 2
-
-    assert strategy._scheduler_state("base_color", analysis)["phase"] == "breakthrough"
-
-
-def test_breakthrough_queue_uses_subspace_batch_instead_of_color_joint_population():
-    shader_params = [
-        ShaderParam("u_Color", "Color", default=[1, 1, 1, 1]),
-        ShaderParam("u_TexPower", "Float", default=1.0, range_min=0.1, range_max=3.0),
-        ShaderParam("u_Saturation", "Float", default=1.0, range_min=0.0, range_max=2.0),
-        ShaderParam("u_Contrast", "Float", default=1.0, range_min=0.0, range_max=2.0),
-    ]
-    params = {"u_Color": [0.5, 0.5, 0.5, 1], "u_TexPower": 1.0, "u_Saturation": 1.0, "u_Contrast": 1.0}
-    graph = build_shader_effect_graph(shader_params, material_params=params)
-    generator = SemanticCandidateGenerator(
-        graph=graph,
-        shader_params=shader_params,
-        encoder_cls=ParameterEncoder,
-        step_schedule=[0.25, 0.14],
-    )
-    archive = TopKArchive(capacity=4)
-    archive.add(
-        params={"u_Color": [0.55, 0.55, 0.55, 1], "u_TexPower": 1.2, "u_Saturation": 0.9, "u_Contrast": 1.1},
-        fit_score=0.82,
-        metrics=metric_vector_from_analysis({"research_metrics": {"components": {"color_mean": 0.20}}}, 0.82),
-    )
-    queue = BreakthroughCandidateQueue(max_size=8)
-
-    queue.ensure(
-        base_params=params,
-        base_fit_score=0.80,
-        analysis={"research_metrics": {"components": {"color_mean": 0.30, "color_p95": 0.25}}},
-        iteration=12,
-        group_cycle=3,
-        groups_by_name=graph.groups,
-        group_order=list(graph.groups),
-        group_scores={name: 1.0 for name in graph.groups},
-        active_groups=set(graph.groups),
-        bottleneck={"color_mean": 0.30, "color_p95": 0.25},
-        archive=archive,
-        generator=generator,
-        param_agenda=[
-            {"param": "u_Color", "priority": 1.0, "group": "base_color"},
-            {"param": "u_TexPower", "priority": 0.9, "group": "base_color"},
-            {"param": "u_Saturation", "priority": 0.8, "group": "color_grade"},
-            {"param": "u_Contrast", "priority": 0.7, "group": "color_grade"},
-        ],
-    )
-
-    popped = [queue.pop() for _ in range(8)]
-    payloads = [item[1] for item in popped if item is not None]
-    assert not any(payload.get("candidate_kind") == "color_joint_population" for payload in payloads)
-    assert any(payload.get("candidate_kind") == "subspace_batch" for payload in payloads)
-
-    queue.ensure(
-        base_params=params,
-        base_fit_score=0.80,
-        analysis={"research_metrics": {"components": {"color_mean": 0.30, "color_p95": 0.25}}},
-        iteration=13,
-        group_cycle=3,
-        groups_by_name=graph.groups,
-        group_order=list(graph.groups),
-        group_scores={name: 1.0 for name in graph.groups},
-        active_groups=set(graph.groups),
-        bottleneck={"color_mean": 0.30, "color_p95": 0.25},
-        archive=archive,
-        generator=generator,
-        param_agenda=[
-            {"param": "u_Color", "priority": 1.0, "group": "base_color"},
-            {"param": "u_TexPower", "priority": 0.9, "group": "base_color"},
-            {"param": "u_Saturation", "priority": 0.8, "group": "color_grade"},
-            {"param": "u_Contrast", "priority": 0.7, "group": "color_grade"},
-        ],
-    )
-    regenerated = [queue.pop() for _ in range(8)]
-    regenerated_payloads = [item[1] for item in regenerated if item is not None]
-    assert not any(payload.get("candidate_kind") == "color_joint_population" for payload in regenerated_payloads)
-    assert queue.summary()["subspace_batch_generated_count"] >= 1
-
-
-def test_breakthrough_queue_uses_param_agenda_candidates():
-    shader_params = [
-        ShaderParam("u_Saturation", "Float", default=1.0, range_min=0.0, range_max=2.0),
-        ShaderParam("u_GammaPower", "Float", default=1.0, range_min=0.05, range_max=3.0),
-    ]
-    params = {"u_Saturation": 1.0, "u_GammaPower": 1.0}
-    graph = build_shader_effect_graph(shader_params, material_params=params)
-    generator = SemanticCandidateGenerator(
-        graph=graph,
-        shader_params=shader_params,
-        encoder_cls=ParameterEncoder,
-        step_schedule=[0.25, 0.14],
-    )
-    queue = BreakthroughCandidateQueue(max_size=6)
-
-    queue.ensure(
-        base_params=params,
-        base_fit_score=0.70,
-        analysis={"research_metrics": {"components": {"color_mean": 0.30}}},
-        iteration=20,
-        group_cycle=3,
-        groups_by_name=graph.groups,
-        group_order=list(graph.groups),
-        group_scores={name: 1.0 for name in graph.groups},
-        active_groups=set(graph.groups),
-        bottleneck={"color_mean": 0.30},
-        archive=TopKArchive(),
-        generator=generator,
-        param_agenda=[
-            {"param": "u_Saturation", "priority": 1.0, "semantic_relevance": 0.1},
-            {"param": "u_GammaPower", "priority": 0.8, "semantic_relevance": 0.1},
-        ],
-    )
-
-    payloads = [item[1] for item in [queue.pop() for _ in range(6)] if item is not None]
-    assert any(payload.get("candidate_kind") == "param_agenda_population" for payload in payloads)
+    assert scheduler["phase"] == "calibration"
+    assert scheduler["force_breakthrough"] is False
+    assert scheduler["trust_region"]["retired"] is True
 
 
 def test_acceptance_policy_rejects_primary_bottleneck_regression():
@@ -1286,7 +1162,7 @@ def test_acceptance_policy_rejects_primary_bottleneck_regression():
     assert decision.reason == "primary_bottleneck_worsened"
 
 
-def test_semantic_group_breakthrough_continues_trust_region_below_global_best():
+def test_response_scheduler_accepts_below_global_best_without_trust_region():
     shader_params = [
         ShaderParam("u_Color", "Color", default=[1, 1, 1, 1]),
         ShaderParam("u_TexPower", "Float", default=1.0, range_min=0.1, range_max=3.0),
@@ -1300,11 +1176,8 @@ def test_semantic_group_breakthrough_continues_trust_region_below_global_best():
         graph=graph,
         auto_adjust_mode="refine_current",
     )
-    strategy._force_breakthrough = True
-    strategy._trust_region.ensure(center_params=base_params, fit_score=0.63)
     strategy._pending = {
-        "group": "__breakthrough__",
-        "kind": "local_population",
+        "kind": "pair_probe",
         "base_params": dict(base_params),
         "base_fit_score": 0.63,
         "base_metrics": metric_vector_from_analysis(
@@ -1330,11 +1203,8 @@ def test_semantic_group_breakthrough_continues_trust_region_below_global_best():
     )
 
     assert result["accepted"] is True
-    assert result["outcome"] == "accepted_trust_region_branch"
+    assert result["outcome"] == "accepted_checkpoint_branch"
     assert result["next_base_params"] == candidate_params
-    summary = strategy._trust_region.summary()
-    assert summary["active"] is True
-    assert summary["center_fit_score"] == pytest.approx(0.64)
 
 
 def test_checkpoint_branch_accepts_below_global_best_without_rollback():
@@ -1492,18 +1362,138 @@ def test_branch_drift_guard_rolls_back_only_after_wide_hard_drop():
     assert hard.should_rollback is True
 
 
-def test_trust_region_branch_expands_and_shrinks_radius():
-    branch = TrustRegionBranch(initial_radius=1.0, min_radius=0.2, expand=1.2, shrink=0.5, failure_limit=2)
-    branch.ensure(center_params={"u_Color": [1, 1, 1, 1]}, fit_score=0.60)
+def test_response_map_records_metric_specific_param_effects():
+    response = ResponseMap(min_score_signal=0.001, min_component_signal=0.002)
+    before = metric_vector_from_analysis(
+        {"research_metrics": {"components": {"color_mean": 0.50, "highlight": 0.20}}},
+        0.40,
+    )
+    after = metric_vector_from_analysis(
+        {"research_metrics": {"components": {"color_mean": 0.44, "highlight": 0.23}}},
+        0.43,
+    )
 
-    branch.record_success(params={"u_Color": [0.9, 1, 1, 1]}, fit_score=0.62, min_improvement=0.001)
-    branch.record_success(params={"u_Color": [0.8, 1, 1, 1]}, fit_score=0.64, min_improvement=0.001)
-    assert branch.summary()["radius"] == pytest.approx(1.2)
+    obs = response.observe_trial(
+        changed_params=["u_Color"],
+        before_params={"u_Color": [0.5, 0.5, 0.5, 1]},
+        after_params={"u_Color": [0.6, 0.5, 0.5, 1]},
+        before=before,
+        after=after,
+        fit_delta=0.03,
+        accepted=True,
+        context_key="score_low:color_mean",
+    )
+    summary = response.summary_for("u_Color", {"color_mean": 0.50}, semantic_relevance=0.05)
 
-    branch.record_failure()
-    branch.record_failure()
-    assert branch.summary()["radius"] == pytest.approx(0.6)
-    assert branch.summary()["active"] is True
+    assert obs["significant"] is True
+    assert summary["attempts"] == 1
+    assert summary["significant_trials"] == 1
+    assert summary["metrics"]["color_mean"]["gain_ema"] > 0
+    assert summary["metrics"]["highlight"]["gain_ema"] < 0
+    assert summary["response_priority"] > 0.05
+
+
+def test_response_map_blocks_zero_signal_exploratory_accept_without_prior():
+    response = ResponseMap(min_score_signal=0.001, min_component_signal=0.002)
+
+    assert response.supports_exploratory_accept(
+        changed_params=["u_SpecularPower"],
+        fit_delta=1.0e-8,
+        component_gain=1.0e-8,
+        bottleneck={"color_mean": 0.70},
+    ) is False
+
+
+def test_semantic_group_does_not_accept_zero_signal_exploration():
+    shader_params = [
+        ShaderParam("u_SpecularPower", "Float", default=1.0, range_min=0.0, range_max=8.0),
+    ]
+    params = {"u_SpecularPower": 1.0}
+    graph = build_shader_effect_graph(shader_params, material_params=params)
+    strategy = SemanticGroupStrategy(
+        initial_params=params,
+        shader_params=shader_params,
+        graph=graph,
+        auto_adjust_mode="refine_current",
+    )
+    strategy._pending = {
+        "group": "specular_smoothness",
+        "kind": "param_priority",
+        "base_params": dict(params),
+        "base_fit_score": 0.40,
+        "base_metrics": metric_vector_from_analysis(
+            {"research_metrics": {"components": {"color_mean": 0.50}}},
+            0.40,
+        ),
+        "changed_params": ["u_SpecularPower"],
+    }
+
+    result = strategy._consume_pending(
+        StrategyContext(
+            iteration=5,
+            current_params={"u_SpecularPower": 1.1},
+            analysis={"research_metrics": {"components": {"color_mean": 0.50}}},
+            diff_score=0.2,
+            fit_score=0.40000001,
+            state=AdjustmentState(best_params=params, best_fit_score=0.40, best_fit_params=params),
+        )
+    )
+
+    assert result["accepted"] is False
+    assert result["branch_exploratory_accept"] is False
+    assert result["outcome"] == "rejected_keep_branch_base"
+    assert result["response_observation"]["significant"] is False
+
+
+def test_response_planner_builds_pair_after_calibration_evidence():
+    shader_params = [
+        ShaderParam("u_Saturation", "Float", default=1.0, range_min=0.0, range_max=2.0),
+        ShaderParam("u_GammaPower", "Float", default=1.0, range_min=0.05, range_max=3.0),
+    ]
+    params = {"u_Saturation": 1.0, "u_GammaPower": 1.0}
+    graph = build_shader_effect_graph(shader_params, material_params=params)
+    strategy = SemanticGroupStrategy(
+        initial_params=params,
+        shader_params=shader_params,
+        graph=graph,
+        auto_adjust_mode="refine_current",
+    )
+    before = metric_vector_from_analysis(
+        {"research_metrics": {"components": {"color_mean": 0.50}}},
+        0.40,
+    )
+    after = metric_vector_from_analysis(
+        {"research_metrics": {"components": {"color_mean": 0.47}}},
+        0.42,
+    )
+    for index in range(8):
+        strategy._response_map.observe_trial(
+            changed_params=["u_Saturation", "u_GammaPower"],
+            before_params=params,
+            after_params={"u_Saturation": 1.05, "u_GammaPower": 1.05},
+            before=before,
+            after=after,
+            fit_delta=0.02,
+            accepted=True,
+            context_key="score_low:color_mean",
+        )
+
+    ranking = strategy._param_ranking(
+        base_params=params,
+        analysis={"research_metrics": {"components": {"color_mean": 0.50}}},
+    )
+    result = strategy._planner.next_trial(
+        base_params=params,
+        analysis={"research_metrics": {"components": {"color_mean": 0.50}}},
+        fit_score=0.42,
+        iteration=12,
+        ranking=ranking,
+        bottleneck={"color_mean": 0.50},
+    )
+
+    assert result is not None
+    assert result.kind == "pair_probe"
+    assert set(result.payload["pair_params"]) == {"u_Saturation", "u_GammaPower"}
 
 
 def test_effective_laya_control_schema_normalizes_searchable_search_param_conflict():

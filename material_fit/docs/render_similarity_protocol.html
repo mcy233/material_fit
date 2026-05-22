@@ -1982,50 +1982,42 @@ iteration_total ≈ analyze_multiview + laya_candidate_capture + small_overhead
           </tbody>
         </table>
 
-        <h3>7.8 当前 Semantic Optimizer v3：Archive 驱动的 Trust-region 搜索</h3>
+        <h3>7.8 当前 Semantic Optimizer v4：Response-driven Experiment Scheduler</h3>
         <div class="callout success">
-          <strong>最新设计原则：</strong><span class="term">Best Guard</span> 只应作为最终输出保护，不应作为每轮搜索的方向盘。真实搜索轨迹由 <span class="term">Top-K Archive</span> 和 <span class="term">Trust-region Branch</span> 管理，允许短期低于全局 best，但必须有半径、失败次数和重启机制约束。
+          <strong>最新设计原则：</strong>主调度不再由固定 group 顺序、visit budget 或特殊 breakthrough 阶段决定，而是由 <span class="term">ResponseMap</span>、当前 metric bottleneck、预算状态和 archive 共同选择下一次真实渲染实验。<span class="term">Best</span> 只作为 checkpoint/archive 输出保护，不再充当每轮搜索方向盘。
         </div>
-        <div class="formula">best_params      = 历史最高 research/fit 分数对应的参数，最终写回
-archive          = 多个高分且参数差异足够大的候选，用于多起点重启
-branch_center    = 当前 trust-region 分支的局部搜索中心
+        <div class="formula">ResponseMap      = 参数 -> 指标分项响应证据（方向、收益、风险、无效率、交互嫌疑）
+ExperimentPlanner = 根据 bottleneck + evidence + budget 选择 trial kind
+TrialIntent      = 本轮真实渲染实验：calibration / single / pair / subspace / archive_restart
 candidate_params = 本轮临时试探参数，只用于真实渲染评估</div>
         <p>
-          近期 150 轮实验显示，过早进入 <span class="term">breakthrough</span> 并反复生成固定 <span class="term">color_joint</span> 候选，会让优化器在全局 best 附近震荡：大量候选相对局部 base 有提升，但无法超过全局 best，随后又被回滚。这说明“Best Guard + 固定 5 步探索”只能防止最终输出倒退，不能作为长期突破局部最优的主算法。
+          近期实验表明，旧架构把 calibration、response pair、breakthrough、cross-group 和 group/pattern 串成一条 if 链，会让多个模块同时争夺调度权，难以解释为什么本轮选择某个参数。v4 将主路径收敛为一个 <span class="term">ExperimentPlanner</span>：每轮只产出一个 <span class="term">TrialIntent</span>，真实渲染返回后再统一更新 ResponseMap、Top-K archive 和 drift guard。
         </p>
         <table>
           <thead><tr><th>机制</th><th>作用</th><th>避免的问题</th></tr></thead>
           <tbody>
-            <tr><td>Best Guard</td><td>只记录全局最高 <span class="term">fit_score/research_score</span>，训练结束强制写回 best。</td><td>最终 .lmat 停在最后一个坏候选；但不再强制每步从 best 出发。</td></tr>
-            <tr><td>Top-K Archive</td><td>保存多个高分且多样的参数点，作为 trust-region 分支的候选中心。</td><td>单一 best 锁死搜索轨迹，无法探索其他近似解。</td></tr>
-            <tr><td>Trust-region Branch</td><td>每个分支有 center、radius、success/failure 计数；成功扩大半径，失败缩小半径。</td><td>固定步数探索没有科学依据，太短跨不过谷底，太长浪费评估。</td></tr>
-            <tr><td>Active Subspace</td><td>根据 component bottleneck 和 influence 证据选择少量相关组/参数。</td><td>全参数空间维度过高，真实渲染评估次数不足。</td></tr>
-            <tr><td>候选去重与限流</td><td>固定 joint 候选只作为少量探针，不能长期占据 breakthrough。</td><td>反复生成同一批大扰动导致震荡而非收敛。</td></tr>
+            <tr><td>ResponseMap</td><td>记录参数对 color、luminance、highlight、structure 等分项 loss 的真实响应。</td><td>只凭语义分组或总分排序，无法知道参数到底改善了什么。</td></tr>
+            <tr><td>ExperimentPlanner</td><td>统一选择 calibration、single、pair、subspace、archive_restart 五类实验。</td><td>多个阶段模块串联导致调度权分散、行为难解释。</td></tr>
+            <tr><td>Top-K Archive</td><td>保存多个高分且多样的参数点，作为 archive_restart 的候选来源。</td><td>单一 best 锁死搜索轨迹，无法探索其他近似解。</td></tr>
+            <tr><td>BranchDriftGuard</td><td>只在明显跑飞或恢复失败时回滚到 checkpoint。</td><td>每轮强制回到 best 会切断需要短期降分的探索路径。</td></tr>
+            <tr><td>Active 参数门控</td><td>根据 bool/define/Intensity 动态区分可写参数和当前有效参数。</td><td>无效下游参数占据搜索预算。</td></tr>
             <tr><td>失败样本保留</td><td>被拒绝的候选仍进入日志和调度统计。</td><td>纯贪婪爬山丢失负样本，后续无法判断哪些方向已失败。</td></tr>
           </tbody>
         </table>
         <p>
-          因此，当前优化器的长期方向不是“每轮回滚到 best”，而是采用 <span class="term">archive-driven trust-region search</span>：全局 best 负责安全输出，搜索分支负责真实探索；分支可以短期低于 best，但必须在信赖域内连续验证。如果分支成功，就移动中心并适度扩大半径；如果失败，就缩小半径或从 Top-K archive 重启。
+          因此，当前优化器不再回答“下一阶段调哪一组”，而是持续回答“当前瓶颈下，哪一种实验最值得花一次真实渲染预算”。语义 group 仍作为参数先验、UI 解释和 gate 辅助存在，但不再是主调度单位。
         </p>
         <div class="formula">while budget remains:
-  update Top-K archive and global_best from real render result
-  if normal semantic search is still informative:
-      continue group/pattern exploration
-  else:
-      branch = select_or_create_trust_region(archive, bottleneck)
-      candidate = propose_within(branch.center, branch.radius, active_subspace)
-      if candidate improves branch:
-          branch.center = candidate
-          branch.radius = expand(branch.radius)
-      else:
-          branch.radius = shrink(branch.radius)
-      if branch.radius too small:
-          restart from another archive point
+  consume previous TrialResult
+  update ResponseMap, Top-K archive, BranchDriftGuard
+  ranking = rank active params by response evidence + bottleneck relevance
+  trial = ExperimentPlanner.next_trial(ranking, bottleneck, budget)
+  render(trial.candidate_params)
 
 final_lmat = global_best.parameters</div>
-        <h4>Bandit 引导的主动坐标选择</h4>
+        <h4>Trial 类型与进入依据</h4>
         <p>
-          参数选择不应只依赖固定组顺序或人工语义。当前实现把每个可搜索参数视为一个 <span class="term">arm</span>，在真实渲染闭环中记录它对各分项 loss 的实际收益，并用类似 <span class="term">UCB / Bandit-based Coordinate Selection</span> 的规则动态排序。语义分组仍保留，但它的职责降级为先验、覆盖度保护和联合候选约束；主调度信号转为全量参数级排序。
+          参数选择不应只依赖固定组顺序或人工语义。当前实现把每个可搜索参数视为一个响应证据单元，在真实渲染闭环中记录它对各分项 loss 的实际收益，并据此选择下一种实验类型。
         </p>
         <div class="formula">param_priority =
   semantic_relevance(current_bottleneck, param)
@@ -2043,14 +2035,28 @@ final_lmat = global_best.parameters</div>
         <table>
           <thead><tr><th>阶段</th><th>选择规则</th><th>进入/退出依据</th></tr></thead>
           <tbody>
-            <tr><td>常规搜索</td><td>先计算全量 <span class="term">param_ranking</span>，选择 priority 最高且所在组仍可工作的参数；若上一组仍接近全局最高 priority，可短暂延续以保持局部收敛。</td><td>不再由固定组顺序主导；组顺序只作为 fallback。</td></tr>
-            <tr><td>refinement</td><td>对瓶颈相关组补足最小覆盖，同时继续收集参数级 evidence；每组内部也按参数 priority 选择单参数 nudge。</td><td>不能只用 visit 次数；必须同时检查最近 gain、no_improve、radius 缩小和关键参数覆盖。</td></tr>
-            <tr><td>breakthrough</td><td>从全局 <span class="term">param_candidate_pool</span> 里选择 top single 参数和少量 top pair 参数，而不是取每组前两个 axis。</td><td>只有多个关键组均出现边际收益下降，且跨组联合的预期 priority 更高时才进入。</td></tr>
+            <tr><td>calibration_probe</td><td>对高优先级 active 参数做正/负方向探针。</td><td>参数缺少足够 response evidence。</td></tr>
+            <tr><td>single_param</td><td>沿稳定方向继续局部搜索。</td><td>单参数有显著收益、风险低、无效率不高。</td></tr>
+            <tr><td>pair_probe</td><td>测试两个参数的联合移动。</td><td>单参数响应弱、上下文敏感或已有交互嫌疑。</td></tr>
+            <tr><td>subspace_batch</td><td>测试 3-8 个高优先级参数的稀疏联合候选。</td><td>近期 best 几乎不增长，出现 plateau。</td></tr>
+            <tr><td>archive_restart</td><td>从 Top-K archive 选择不同 checkpoint 分支。</td><td>长窗口 plateau 或 drift guard 判定当前分支恢复失败。</td></tr>
           </tbody>
         </table>
         <p>
-          因此，breakthrough 的职责不是补做基础搜索，而是在组内优化已经出现收益衰减后，用证据排序出的关键参数进行跨组联合精修。典型候选不是“每组前两个参数”，而是如 <span class="term">u_Saturation + u_GammaPower</span>、<span class="term">u_ShadowSmoothness + u_ShadowThreshold1</span>、<span class="term">u_SpecularIntensity + u_SpecularPower</span> 这类由瓶颈指标和历史收益共同支持的组合。
+          这样，原来的 breakthrough 被拆解为可解释的普通实验：参数对由 <span class="term">pair_probe</span> 负责，低维联合由 <span class="term">subspace_batch</span> 负责，多起点切换由 <span class="term">archive_restart</span> 负责。它们不再绕过主调度，也不会长期占据预算。
         </p>
+        <h4>优化器对照组</h4>
+        <p>
+          2026-05-22 的 500 轮实验显示，当前 response scheduler 可能退化为高 no-effect 单参数的重复搜索。因此工具现在保留三条可切换路线，用于把“修补当前算法”和“复现旧高分基线”分开验证。
+        </p>
+        <table>
+          <thead><tr><th>optimizer</th><th>定位</th><th>适用实验</th><th>主要风险</th></tr></thead>
+          <tbody>
+            <tr><td><span class="term">semantic_group</span></td><td>当前 ResponseMap + ExperimentPlanner 调度器，含单参预算上限、no-effect cooldown、近期预算占比审计和 plateau 后 subspace/archive 优先。</td><td>验证响应图是否能避免单参塌缩，并观察参数-指标映射质量。</td><td>仍依赖在线证据，早期证据差时可能选错子空间。</td></tr>
+            <tr><td><span class="term">semantic_group_legacy_081</span></td><td>从旧高分版本恢复的 pattern-search 语义组基线，保留 <span class="term">probe_group / pattern_search / cross_group_combo</span>，不接入 ResponseMap。</td><td>复现旧 0.8 附近效果，作为稳定对照。</td><td>不具备新响应图诊断能力，也不一定突破 0.8。</td></tr>
+            <tr><td><span class="term">subspace_cma_es</span></td><td>效果优先的昂贵黑盒算法，在 4-10 维 active 子空间内运行 CMA-ES ask/tell。</td><td>500-1000 轮效果优先实验和论文对照。</td><td>每个候选仍需真实渲染，population/generation 成本明显更高。</td></tr>
+          </tbody>
+        </table>
 
         <h3>7.9 突破 0.8 上限的研究方案筛选：从神经网络到代理辅助优化</h3>
         <div class="callout warning">

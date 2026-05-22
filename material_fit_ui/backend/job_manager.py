@@ -109,9 +109,9 @@ def start_job(
     # evals). Default to 30 for CMA-ES, 6 for heuristic, but always
     # honour an explicit ``algo['max_iterations']`` override.
     optimizer_value_for_default = str(algo.get("optimizer", "heuristic")).strip().lower()
-    if optimizer_value_for_default in ("cma_cold", "cma_warm"):
+    if optimizer_value_for_default in ("cma_cold", "cma_warm", "subspace_cma_es"):
         default_iterations = 30
-    elif optimizer_value_for_default == "semantic_group":
+    elif optimizer_value_for_default in ("semantic_group", "semantic_group_legacy_081"):
         default_iterations = 12
     else:
         default_iterations = 6
@@ -187,7 +187,14 @@ def start_job(
     # 'heuristic' value matches fit_material.py's own default, so old
     # projects without these fields still work unchanged.
     optimizer_value = str(algo.get("optimizer", "heuristic")).strip().lower()
-    if optimizer_value not in ("heuristic", "cma_cold", "cma_warm", "semantic_group"):
+    if optimizer_value not in (
+        "heuristic",
+        "cma_cold",
+        "cma_warm",
+        "semantic_group",
+        "semantic_group_legacy_081",
+        "subspace_cma_es",
+    ):
         optimizer_value = "heuristic"
     args.extend(["--optimizer", optimizer_value])
 

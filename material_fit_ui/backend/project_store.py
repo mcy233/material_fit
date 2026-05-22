@@ -242,8 +242,8 @@ def create_project(
                 "mean_diff_restore_threshold": 2.5,
             },
             # E-006/E-014: optimizer is pluggable. 'semantic_group'
-            # is the shader-semantics-driven low-dimensional path;
-            # cma_* remain available for ablations.
+            # is the current response scheduler; legacy/subspace variants
+            # remain available for comparison runs.
             "optimizer": "semantic_group",
             "cma_es": {
                 "mode": "warm",
@@ -460,7 +460,14 @@ def derive_fit_config(project_id: str, config: LoaderConfig | None = None) -> di
     # legacy single-reference image pair is intentionally no longer derived.
 
     optimizer_value = str(algo.get("optimizer", "heuristic")).strip().lower()
-    if optimizer_value not in ("heuristic", "cma_cold", "cma_warm", "semantic_group"):
+    if optimizer_value not in (
+        "heuristic",
+        "cma_cold",
+        "cma_warm",
+        "semantic_group",
+        "semantic_group_legacy_081",
+        "subspace_cma_es",
+    ):
         optimizer_value = "heuristic"
     raw_cma_es = algo.get("cma_es") if isinstance(algo.get("cma_es"), dict) else {}
     raw_mix = raw_cma_es.get("hint_bias_mix_ratio", 0.30)

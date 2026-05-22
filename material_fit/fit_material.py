@@ -84,14 +84,22 @@ def main() -> int:
     )
     parser.add_argument(
         "--optimizer",
-        choices=("heuristic", "cma_cold", "cma_warm", "semantic_group"),
+        choices=(
+            "heuristic",
+            "cma_cold",
+            "cma_warm",
+            "semantic_group",
+            "semantic_group_legacy_081",
+            "subspace_cma_es",
+        ),
         default=None,
         help=(
             "Which optimizer drives parameter proposals. 'heuristic' is the "
             "stage-aware channel-bias path; 'cma_cold' is vanilla CMA-ES; "
             "'cma_warm' is Warm-Started CMA-ES seeded from prior auto_adjust "
-            "iterations; 'semantic_group' is a low-dimensional effect-group "
-            "search driven by the shader effect graph. Defaults to "
+            "iterations; 'semantic_group' is the current response scheduler; "
+            "'semantic_group_legacy_081' preserves the old pattern-search baseline; "
+            "'subspace_cma_es' runs expensive CMA-ES in a small active subspace. Defaults to "
             "config['optimizer'] or 'heuristic'."
         ),
     )
@@ -185,7 +193,14 @@ def main() -> int:
     laya_material_params = lmat_io.extract_params(laya_material)
     initial_params = build_initial_params(laya_material_params, laya_shader.params)
     configured_optimizer = (args.optimizer or str(config.get("optimizer", "heuristic"))).strip().lower()
-    if configured_optimizer not in ("heuristic", "cma_cold", "cma_warm", "semantic_group"):
+    if configured_optimizer not in (
+        "heuristic",
+        "cma_cold",
+        "cma_warm",
+        "semantic_group",
+        "semantic_group_legacy_081",
+        "subspace_cma_es",
+    ):
         configured_optimizer = "heuristic"
     adjustment_policies = build_adjustment_policies(laya_shader.params)
     adjustment_policies = _filter_policies_by_effect_graph(
@@ -194,7 +209,7 @@ def main() -> int:
     )
     stages = policies_to_fit_stages(adjustment_policies) or build_stage_plan(laya_shader.params)
     stage_plan_payload: list[dict[str, Any]] = [stage.__dict__ for stage in stages]
-    if configured_optimizer == "semantic_group":
+    if configured_optimizer in ("semantic_group", "semantic_group_legacy_081", "subspace_cma_es"):
         stage_plan_payload = _semantic_stage_plan_from_effect_graph(config.get("effect_graph")) or stage_plan_payload
     unity_material_params = _load_unity_material_params(config, project_root)
 

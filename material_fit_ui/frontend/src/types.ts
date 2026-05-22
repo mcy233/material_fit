@@ -428,7 +428,13 @@ export interface LayaRefreshProbeConfig {
   mean_diff_restore_threshold: number;
 }
 
-export type OptimizerKind = 'heuristic' | 'cma_cold' | 'cma_warm' | 'semantic_group';
+export type OptimizerKind =
+  | 'heuristic'
+  | 'cma_cold'
+  | 'cma_warm'
+  | 'semantic_group'
+  | 'semantic_group_legacy_081'
+  | 'subspace_cma_es';
 
 export interface CmaEsConfig {
   // mode is informational; the active mode is encoded by OptimizerKind

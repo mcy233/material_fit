@@ -112,9 +112,14 @@ class AcceptancePolicy:
         worst_delta = self._worst_view_delta(base, candidate)
         risk_penalty = self._risk_penalty(worst_delta)
         net_component_gain = max(component_gain - risk_penalty, 0.0)
-        is_breakthrough = phase == "breakthrough"
+        exploratory_component_phase = phase in {
+            "breakthrough",
+            "pair_probe",
+            "subspace_batch",
+            "archive_restart",
+        }
         within_drop = fit_delta >= -self.provisional_fit_drop
-        if is_breakthrough and within_drop and net_component_gain >= self.component_gain_threshold:
+        if exploratory_component_phase and within_drop and net_component_gain >= self.component_gain_threshold:
             self.provisional_accept_count += 1
             return AcceptanceDecision(
                 accepted=True,
